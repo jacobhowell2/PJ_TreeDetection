@@ -1,0 +1,75 @@
+---
+title: "PJ_AGB_TreeDetection"
+author: "Jake Howell"
+date: "2026-01-14"
+output: html_document
+---
+
+# Install Packages & Load Libraries
+```{r setup, include=FALSE}
+# Required packages for cloud2trees
+print("Checking necessary libraries are installed.")
+pckgs <- c("pkgbuild",
+           "remotes",
+           "lasR",
+           "lidR",
+           "mapview",
+           "units",
+           "ggplot2",
+           "broom",
+           "purrr",
+           "stringr")
+
+newPckgs <- pckgs[!(pckgs %in% installed.packages()[,"Package"])]
+
+if(length(newPckgs) > 0) install.packages(newPckgs)
+
+# Load libraries
+library(sf)
+library(dplyr)
+library(sp)
+library(raster)
+library(terra)
+library(lidR)
+library(ForestTools)
+library(cloud2trees)
+library(mapview)
+library(units)
+library(ggplot2)
+library(broom)
+library(purrr)
+library(stringr)
+
+# Check if build tools are available 
+pkgbuild::check_build_tools(debug = TRUE)
+
+## Check for package installations from github 
+# TreeLS for extracting DBH
+if (!requireNamespace("TreeLS", quietly = TRUE)) {
+  # Install TreeLS  if not already installed
+  remotes::install_github(repo = "tiagodc/TreeLS", upgrade = F)
+}
+
+# LaddarFuelsR for estimating crown base height
+if (!requireNamespace("LaddarFuelsR", quietly = TRUE)) {
+  # Install LadderFuelsR 
+  remotes::install_github(repo = "olgaviedma/LadderFuelsR", upgrade = F)
+}
+
+# leafR 
+if (!requireNamespace("leafR", quietly = TRUE)) {
+  # Install leafR  if not already installed
+  remotes::install_github(repo = "DRAAlmeida/leafR", upgrade = F)
+}
+
+# cloud2trees
+if (!requireNamespace("cloud2trees", quietly = TRUE)) {
+  # Install cloud2trees
+  remotes::install_github(repo = "georgewoolsey/cloud2trees", upgrade = F)
+}
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
