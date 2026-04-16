@@ -1,5 +1,11 @@
-### Model Biomass from CHMs using Individual Tree Detection
-## Author: Jake Howell
+### Modeling Aboveground Biomass of Individual Trees in PJ-woodlands 
+
+### Purpose: Use CHM's derived from NAIP imagery (Allred et al., 2025) to model
+### individual tree biomass using tree detection
+
+### Author: Jake Howell : u1537023@umail.utah.edu
+
+### Last Updated: 1/28/26
 
 ### Install Packages------------------------------------------------------------
 # Look where R is installing packages
@@ -342,7 +348,7 @@ for (plot_id in chm_names) {
   
   # Skip if detection failed or returned nothing
   if (is.null(treeCrowns_i) || nrow(treeCrowns_i) == 0) {
-    message("  ⏭️ No trees detected for plot ", plot_id, " — skipping.")
+    message("No trees detected for plot ", plot_id, "skipping.")
     next
   }
   
@@ -373,11 +379,11 @@ allTreeCrowns <- do.call(rbind, treeCrowns_list)
 
 ### EXPLORE RESULTS-------------------------------------------------------------
 # Select the first plot name
-first_plot <- names(treeCrowns_list)[1]
+first_plot <- names(treeCrowns_list)[2]
+# first_plot <- "UOFU_UTMO_P07"
 
 # Extract CHM and crown polygons
 chm_i     <- allPlotsCHMs[[first_plot]]
-
 plot(chm_i)
 
 crowns_i  <- treeCrowns_list[[first_plot]]
@@ -387,7 +393,7 @@ points_i <- treePoints_list[[first_plot]]
 crowns_i <- st_transform(crowns_i, st_crs(chm_i))
 
 # Plot CHM
-plot(chm_i, main = paste("CNN-CHM using VWS1:", first_plot))
+plot(chm_i, main = paste("NAIP-derived CHM using VWS1:", first_plot))
 
 # Overlay crown segments
 plot(st_geometry(crowns_i),
@@ -462,6 +468,7 @@ fit <- optim(
   upper = c(100,   5,  5)
 )
 
+# Return the predicted biomass
 predicted <- predict_plot_biomass(fit$par)
 
 # scatterplot
@@ -492,11 +499,12 @@ MAPE <- mean(abs((obs - pred) / obs)) * 100
 SSE <- sum((obs - pred)^2)
 SST <- sum((obs - mean(obs))^2)
 R2 <- 1 - SSE/SST
+print(R2)
 
 # 6. Relative RMSE (RMSE / mean observed)
 rRMSE <- RMSE / mean(obs) * 100
 
-# Print metrics
+# Save metrics
 NAIP_chm_vws1_metrics <- data.frame(
   RMSE = RMSE,
   MAE = MAE,
@@ -510,25 +518,11 @@ plot(obs, pred,
      xlab = "Observed plot biomass",
      ylab = "Predicted plot biomass",
      main = "Observed vs Predicted Plot Biomass")
-
 abline(0, 1, col = "red", lwd = 2)
 
-# Add text to the plot showing metrics
-text_x <- min(obs) + 0.05*(max(obs) - min(obs))
-text_y <- max(pred) - 0.1*(max(pred) - min(pred))
 
-metrics_label <- paste0(
-  "R² = ", round(R2, 3), "\n",
-  "RMSE = ", round(RMSE, 3), "\n",
-  "MAE = ", round(MAE, 3)
-)
 
-text(x = par("usr")[2] * 1.05,   # 5% to the right of x-axis max
-     y = mean(par("usr")[3:4]), # vertically centered
-     labels = metrics_label,
-     adj = 0)
-
-### Create biomass allometries at the individual tree level (LOG–LOG) -----
+### Create biomass allometries at the individual tree level (log-log)
 # Create tree and plot df
 df_tree <- allTreeCrowns
 df_plot <- plotLevelBiomass
@@ -547,7 +541,6 @@ df <- merge(df_plot, df_tree)
 # Log transform
 df$log_observed_bio <- log(df$plot_biomass)
 df_plot$log_observed_bio <- log(df_plot$plot_biomass) 
-plot(df_plot$log_observed_bio)
 
 # Remove invalid values 
 df <- df[
@@ -559,18 +552,26 @@ df <- df[
 # Split into list by plot
 tree_list <- split(df, df$plot_id)
 
-# Extract observed plot biomass
+# Extract the observed plot biomass
+# This is returning a numeric values of each of the plots observed biomass
 plot_biomass <- tapply(
   df$plot_biomass,
   df$plot_id,
   FUN = function(x) x[1]
 )
 
-# Log–log predictive model
+print(plot_biomass)
+
+# Predict log - log biomass 
 predict_plot_biomass_loglog <- function(params) {
   
-  alpha <- params[1]  # log(a)
+  # Intercept
+  a     <- params[1]  
+  
+  # Coefficient for tree height
   b     <- params[2]
+  
+  # Coefficient for crown area
   c     <- params[3]
   
   pred <- numeric(length(tree_list))
@@ -579,20 +580,21 @@ predict_plot_biomass_loglog <- function(params) {
   for (i in seq_along(tree_list)) {
     trees <- tree_list[[i]]
     
-    # tree-level log–log model
-    log_tree_agb <- alpha +
-      b * log(trees$tree_height) +
-      c * log(trees$tree_area)
+    # Set the equation for AGB for individual trees
+    log_tree_agb <- a +  b * log(trees$tree_height) + c * log(trees$tree_area)
     
+    # Back-transform
     tree_agb <- exp(log_tree_agb)
     
+    # Get the predicted AGB for each tree
     pred[i] <- sum(tree_agb, na.rm = TRUE)
   }
   
   pred
 }
 
-# Objective function (plot-level SSE)
+
+# Set the ojective function (plot-level SSE)
 objective_loglog <- function(params) {
   pred <- predict_plot_biomass_loglog(params)
   resid <- log(plot_biomass[names(pred)]) - log(pred)
@@ -617,7 +619,6 @@ fit_loglog <- optim(
 
 # Predictions
 predicted_plot_agb <- predict_plot_biomass_loglog(fit_loglog$par)
-summary(predicted_plot_agb)
 
 # Back-transform coefficients for reporting
 a_hat <- exp(fit_loglog$par[1])
@@ -680,16 +681,27 @@ df_plot_level <- df_plot %>%
 
 
 
-
+### Predict Plot Level Biomass using Log-Log function---------------------------
+# Function to predict tree level biomass
 predict_plot_biomass <- function(params) {
   
+  # Intercept
   a <- params[1]
+  
+  # Exponent of Height
   b <- params[2]
+  
+  # Exponent of crown area
   c <- params[3]
   
+  # Create vector to store predictions
+  # Pred = the total predicted biomass for each plot
   pred <- numeric(length(tree_list))
+  
+  # This will store the names of each plot with it's predicted biomass
   names(pred) <- names(tree_list)
   
+  # Loops through each individual tree 
   for(i in seq_along(tree_list)) {
     trees <- tree_list[[i]]
     tree_vals <- a * (trees$tree_height^b) * (trees$tree_area^c)
@@ -748,20 +760,19 @@ log_pred <- log(pred_linear[names(plot_biomass)])
 resid_log    <- log_obs - log_pred
 resid_linear <- plot_biomass - pred_linear[names(plot_biomass)]
 
-# R² in log space
+# Get R2 for log space
 R2_log <- 1 - sum(resid_log^2) / sum((log_obs - mean(log_obs))^2)
+print(R2_log)
 
-# R² in linear space
+# R2 in linear space
 R2_lin <- 1 - sum(resid_linear^2) / sum((plot_biomass - mean(plot_biomass))^2)
 
 # RMSE
 RMSE <- sqrt(mean(resid_linear^2))
 
-c(
-  R2_log  = R2_log,
+print(c(R2_log  = R2_log,
   R2_lin  = R2_lin,
-  RMSE    = RMSE
-)
+  RMSE    = RMSE))
 
 
 
