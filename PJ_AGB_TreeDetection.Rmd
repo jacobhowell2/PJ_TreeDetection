@@ -5,7 +5,6 @@ date: "2026-01-14"
 output: html_document
 ---
 
-# Install Packages & Load Libraries
 ```{r setup, include=FALSE}
 # Required packages for cloud2trees
 print("Checking necessary libraries are installed.")
@@ -69,7 +68,117 @@ if (!requireNamespace("cloud2trees", quietly = TRUE)) {
 }
 
 knitr::opts_chunk$set(echo = TRUE)
+
+### Set up data for Cloud2Trees
+# Location of cloud2trees data needed to extract features to tree list:  If a 
+# custom directory is not set up, data will download to users tempdir() folder
+locExtData <- r'(N:\Howell\PJ_Forests\99_ExtData\cloud2trees)'
+
+### Download TreeMap, Forest Type Group, and LANDFIRE data ---------------------
+# Download ALL external data to estimate tree DBH, FIA forest type, and LANDFIRE 
+# fuel loading. This data must be downloaded first before using
+cloud2trees::get_data(savedir = locExtData, force = F)
+
+## OR download individual data sets to external data directory
+# Download TreeMap 2016 to derive site-specific allometric equations using data
+# from FIA. This is a ~3 GB download that must be run the first time using the
+# cloud2trees package
+cloud2trees::get_treemap(savedir = locExtData, force = F)
+
+# Download the Forest Type Groups of the Continental US data. This group layer 
+# includes a 30-meter resolution of forest type data. This is a ~2GB download
+# that must be downloaded the first time cloud2trees is run
+cloud2trees::get_foresttype(savedir = locExtData, force = F)
+
+# Download LANDFIRE data to estimate tree crown biomass using the forest canopy
+# bulk density to determine the fuel loading of a particular area
+cloud2trees::get_landfire(savedir = locExtData, force = F)
 ```
+
+## Set Data Inputs
+```{r}
+# Set parent location
+loc <- r'(N:\Howell\PJ_Forests)'
+
+## SITE RASTER DATA 
+# Name of the folder containing the site level data
+foldSite <- "01_Sites"
+
+# Name of the folder containing the lidar CHM data
+foldLidarCHM <- "lidar_CHM"
+
+# Name of the folder containing the CNN-CHM
+foldNAIPCHM <- "kNN_CHM"
+
+# Set file path
+pathLidarCHMs <- file.path(loc, foldSite, foldLidarCHM)
+pathCNNCHM <- file.path(loc, foldSite, foldNAIPCHM)
+
+# List the sites within this folder
+lidarSiteNames <- list.files(pathLidarCHMs, pattern = "\\.tif$", full.names = TRUE)
+NAIPSitenames <- list.files(pathCNNCHM, pattern = "\\.tif$", full.names = TRUE)
+
+# Now read the rasters as a list
+siteRast <- lapply(siteNames, rast)
+
+## PLOT DATA
+# Set the name of plot folder
+foldPlot <- "02_Plots"
+
+# If CHM's already exist, set name of CHM data
+foldClippedLidarPlots <- "ClippedLidarCHMs/Buffered"
+
+# Set full path to clipped plot CHMs
+pathClippedPlots <- file.path(loc, foldPlot, foldClippedLidarPlots)
+
+# Set plot names
+plotNames <- list.files(pathClippedPlots, pattern = "\\.tif$", full.names = TRUE)
+
+# Now read the rasters as a list
+plotRast <- lapply(plotNames, rast)
+
+# Set the name of the plot level .csv
+namePlotData <- "plot_level_data_uofu.csv"
+
+# Set full path to plot level data
+fullPlotPath <- file.path(loc, foldPlot, namePlotData)
+
+# Read plot field data
+plotData <- read.csv(fullPlotPath)
+
+## TREE DATA ------------
+foldTree <- "03_Trees"
+
+# Set the name of the tree data
+nameTreeData <- "tree_level_data.csv"
+
+# Set full path to tree level data
+fullTreePath <- file.path(loc, foldTree, nameTreeData)
+
+# Read tree data
+treeData <- read.csv(fullTreePath)
+
+## BIOMASS EQUATIONS
+pathBiomass <- r'(N:\Howell\PJ_Forests\04_Biomass\all_tree_species_in_pj_fia_plots_new.csv)'
+
+# Read biomass equations
+biomassEquations <- read.csv(pathBiomass)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

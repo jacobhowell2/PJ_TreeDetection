@@ -1,0 +1,305 @@
+---
+title: "PJ_Ecosystem_DV"
+author: "Jake Howell"
+date: "2026-03-17"
+output: html_document
+---
+
+# Install packages/ load libraries
+```{r setup, include=FALSE}
+# Required packages for cloud2trees
+print("Checking necessary libraries are installed.")
+pckgs <- c("sgsR", 
+           "terra", 
+           "sf",
+           "mapview",
+           "shiny",
+           "leaflet",
+           "leafem",
+           "RColorBrewer")
+
+newPckgs <- pckgs[!(pckgs %in% installed.packages()[,"Package"])]
+
+if(length(newPckgs) > 0) install.packages(newPckgs)
+
+# Load libraries
+library(sgsR)
+library(terra)
+library(sf)
+library(mapview)
+library(shiny)
+library(leaflet)
+library(leafem)
+library(RColorBrewer)
+
+```
+
+# Set Paths
+```{r}
+# PJ-Ecosystem Wide Boundary
+pj_bounds <- r'(S:\ursa\howell\Research\PJ_forests\06_PJ_Extents\polygons\pj_polygon.shp)'
+
+# PRISM DEM Data: CONUS wide
+dem_CONUS <- r'(S:\ursa\howell\Research\PJ_forests\07_Ancillary\PRISM_us_dem_800m_bil\PRISM_us_dem_800m_bil.bil)'
+
+# PRISM Climate Data: CONUS wide
+ppt_CONUS <- r'(S:\ursa\howell\Research\PJ_forests\07_Ancillary\prism_ppt_us_30s_2020_avg_30y\prism_ppt_us_30s_2020_avg_30y.tif)'
+
+# Site extent data
+site_poly <- r'(S:\ursa2\campbell\pj_als_gedi\data\field_data\site_polygons.shp)'
+
+```
+
+# Read Data
+```{r}
+# Read in PJ Boundary
+pj_boundary <- vect(pj_bounds)
+
+# Read in DEM
+dem <- rast(dem_CONUS)
+
+# Read in precipitation data
+ppt <- rast(ppt_CONUS)
+
+# Read in site paths
+sites <- vect(site_poly)
+
+```
+
+# Process data 
+```{r}
+# Reproject PJ boundary to match raster data
+pj_boundary <- project(pj_boundary, crs(dem))
+sites <- project(sites, crs(dem))
+
+# Clip and mask data to PJ boundary
+dem_pj <- crop(dem, pj_boundary)
+ppt_pj <- crop(ppt, pj_boundary)
+
+# Mask to PJ boundary
+dem_pj <- mask(dem_pj, pj_boundary)
+ppt_pj <- mask(ppt_pj, pj_boundary)
+
+# Ensure raster names are set
+names(dem_pj) <- "elevation"
+names(ppt_pj) <- "precipitation"
+
+```
+
+# Stratify the precip and elevation data into nine classes
+```{r}
+# Composite the DEM and precip data into a single raster
+compRast <- c(dem_pj, ppt_pj)
+
+# Stratify the data into 9 classes
+stratRast <- strat_quantiles(
+  mraster = compRast[[1:2]],
+  nStrat = list(3, 3),
+  plot = FALSE,
+  map = TRUE
+)
+
+# Set final stratification
+finalStrat <- stratRast[[3]]
+
+```
+
+# Plot data using MapView
+```{r}
+# Plot data using Mapview
+mapview(finalStrat)
+
+```
+# Extract the mean strata value for each site
+```{r}
+# Extract mean strata value to each site polygon
+sites_strata <- terra::extract(
+  x = finalStrat,
+  y = sites,
+  fun = mean,
+  na.rm = TRUE,
+  exact = TRUE,
+  bind = TRUE
+)
+
+# Rename the extracted field
+names(sites_strata)[names(sites_strata) == names(finalStrat)] <- "mean_strata"
+
+# If you want to overwrite your sites object with the new attribute:
+sites <- sites_strata
+sites <- round(sites_strata, digits = 1)
+
+sites$mean_strata
+
+
+
+```
+
+
+```{r}
+# Convert vectors to sf for leaflet
+pj_boundary_sf <- st_as_sf(pj_boundary)
+sites_sf <- st_as_sf(sites)
+
+# Reproject everything to WGS84 for web mapping
+finalStrat_ll <- project(finalStrat, "EPSG:4326", method = "near")
+pj_boundary_sf_ll <- st_transform(pj_boundary_sf, 4326)
+sites_sf_ll <- st_transform(sites_sf, 4326)
+sites_sf_ll$site_label <- as.character(sites_sf_ll$site_id)
+
+# Make sure raster values are categorical integers
+finalStrat_leaf <- round(finalStrat_ll)
+
+# Color palette for 9 strata
+strata_vals <- unname(sort(na.omit(unique(values(finalStrat_ll)))))
+strata_pal <- colorFactor(
+  palette = colorRampPalette(c("red", "yellow", "green"))(length(strata_vals)),
+  domain = strata_vals,
+  ordered = TRUE
+)
+
+# finalStrat_leaf <- aggregate(finalStrat_ll, fact = 1, fun = modal)
+plot(finalStrat_leaf)
+
+```
+
+```{r}
+mapview(finalStrat_leaf)
+
+```
+
+```{r}
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML("
+      body {
+        background: linear-gradient(135deg, #2f3e2f 0%, #5c4b3b 45%, #a67c52 100%);
+        background-attachment: fixed;
+        color: white;
+      }
+
+      .container-fluid {
+        padding: 20px;
+      }
+
+      .header-row-custom {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        background: rgba(0, 0, 0, 0.35);
+        padding: 20px;
+        border-radius: 12px;
+        margin-bottom: 15px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      }
+
+      .header-title-custom {
+        margin: 0;
+        color: white;
+        font-weight: 700;
+        font-size: 32px;
+      }
+
+      .header-image-custom img {
+        height: 80px;
+        width: auto;
+        border-radius: 10px;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.35);
+      }
+
+      .info-panel-custom {
+        background: rgba(255, 255, 255, 0.12);
+        backdrop-filter: blur(4px);
+        -webkit-backdrop-filter: blur(4px);
+        padding: 15px;
+        border-radius: 12px;
+        margin-bottom: 15px;
+        line-height: 1.6;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+      }
+
+      #map {
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+      }
+
+      p {
+        color: white;
+        font-size: 15px;
+      }
+    "))
+  ),
+
+  div(
+    class = "header-row-custom",
+    tags$h1("Pinyon-Juniper Woodlands Dashboard", class = "header-title-custom"),
+    div(
+      class = "header-image-custom",
+      tags$img(src = "N:/Howell/DataVisualization/FinalProject/PJ_image.jpg", alt = "Pinyon-Juniper ecosystem photo")
+    )
+  ),
+
+  div(
+    class = "info-panel-custom",
+    p(
+      "Pinyon-juniper woodlands represent one of the most extensive dryland forest ecosystems in the western United States. ",
+      "This dashboard displays a landscape stratification of PJ ecosystems derived from ",
+      tags$b("30-year mean precipitation"),
+      " and ",
+      tags$b("elevation"),
+      ", two variables that capture broad climatic and topographic gradients across the region."
+    )
+  ),
+
+  leafletOutput("map", height = 500)
+)
+
+# Create a server
+server <- function(input, output, session) {
+  output$map <- renderLeaflet({
+    leaflet() |>
+      addTiles() |>
+      addRasterImage(
+        finalStrat_leaf,
+        colors = strata_pal,
+        opacity = 0.6,
+        project = TRUE
+      ) |>
+      addPolygons(
+        data = pj_boundary_sf_ll,
+        color = "red",
+        weight = 2,
+        fill = FALSE
+      ) |>
+      addPolygons(
+        data = sites_sf_ll,
+        color = "black",
+        weight = 1.5,
+        fill = FALSE,
+        group = "Site Boundaries",
+        label = ~site_label,
+        labelOptions = labelOptions(
+          noHide = TRUE,
+          direction = "center",
+          textOnly = TRUE,
+          style = list(
+            "font-size" = "14px",
+            "font-weight" = "normal",
+            "color" = "black",
+            "text-shadow" = "1px 1px 2px black"
+          )
+        )
+      ) |>
+      addLegend(
+        position = "bottomright",
+        pal = strata_pal,
+        values = strata_vals,
+        title = "Strata"
+      )
+  })
+}
+
+shinyApp(ui, server)
+```

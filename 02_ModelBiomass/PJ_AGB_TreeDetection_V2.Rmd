@@ -1,0 +1,2870 @@
+---
+title: "Modeling Aboveground Biomass of Individual Trees in Pinyon-Juniper Woodlands"
+author: "Jake Howell"
+date: "`r Sys.Date()`"
+purpose: 
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: cosmo
+    highlight: tango
+---
+
+
+```{r}
+# Set output formats
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  fig.align = "center"
+)
+```
+
+## Script Purpose:
+ Here we present our methods for estimating the aboveground biomass of individual trees within Pinyon-Juniper Woodlands using Using field data collected from 180 field plots, paired with two Canopy Height Model (CHM) sources.
+
+Let's begin by getting things set up.
+
+Be sure the required packages are installed and libraries are loaded.
+
+```{r setup, include = FALSE}
+# Check required packages are installed
+pckgs <- c("sf",
+           "dplyr",
+           "sp",
+           "raster",
+           "terra",
+           "lidR",
+           "mapview",
+           "units",
+           "ggplot2",
+           "broom",
+           "purrr",
+           "stringr",
+           "tidyr")
+
+# Point to packages
+newPckgs <- pckgs[!(pckgs %in% installed.packages()[,"Package"])]
+
+# If length is greater than 0, install the packages
+if(length(newPckgs) > 0) install.packages(newPckgs)
+
+# Load libraries
+library(sf)
+library(dplyr)
+library(sp)
+library(raster)
+library(terra)
+library(lidR)
+library(mapview)
+library(units)
+library(ggplot2)
+library(broom)
+library(purrr)
+library(stringr)
+library(tidyr)
+
+```
+
+## Set up
+
+We'll begin by setting the paths to our data. The required data are as follows 
+
+- Lidar-Derived Canopy Height Models (.tif)
+- NAIP-derived Canopy Height Models (.tif)
+- Spreadsheet of field plot data (.csv)
+- Spreadsheet of tree level data (.csv)
+- Spreadsheet of AGB equations (.csv)
+
+```{r}
+# Set root data location
+loc <- r'(S:\ursa\howell\Research\PJ_forests)'
+
+# Set the name of the site data folder 
+foldSite <- "01_Sites"
+
+# Set the name of the plot level folder
+foldPlot <- "02_Plots"
+
+# Set the folder of NAIP-derived site-level CHMs
+foldNAIP_CHM <- "01_NAIP_CHMs"
+
+# Set the folder of the lidar-derived plot-level CHMs
+foldLidar_CHM <- "03_LidarDerivedCHMs/Original"
+
+# Set the name of the plot level .csv
+namePlotData <- "plot_level_data_uofu.csv"
+
+## TREE-LEVEL DATA: 
+foldTree <- "03_TreeData"
+
+# Set the name of the tree data
+nameTreeData <- "tree_level_data.csv"
+
+# Set name to AGB equations
+nameAGB <- "all_tree_species_in_pj_fia_plots_new.csv"
+
+# Initialize paths
+pathNAIPsites <- file.path(loc, foldSite, foldNAIP_CHM)
+pathLidarPlots <- file.path(loc, foldPlot, foldLidar_CHM)
+pathPlotData <- file.path(loc, foldPlot, namePlotData)
+pathTreeData <- file.path(loc, foldTree, nameTreeData)
+pathAGBData <- file.path(loc, foldTree, nameAGB)
+
+```
+
+Now let's set our output paths
+```{r}
+# Path to export our clipped NAIP-derived CHMs
+outClippedPlots_NAIP <- r'(S:\ursa\howell\Research\PJ_forests\02_Plots\01_NAIPDerivedCHMs)'
+
+# Path to export our clipped lidar-derived CHMs
+outClippedPlots_Lidar <- r'(S:\ursa\howell\Research\PJ_forests\02_Plots\03_LidarDerivedCHMs)'
+
+# Path to export our lidar-derived tree crowns
+# outTreeCrowns_Lidar <- 
+# 
+# # Path to export our lidar-derived tree points
+# outTreePoints_Lidar <- 
+#   
+# # Path to export our NAIP-derived tree crowns
+# outTreeCrowns_NAIP <-   
+#   
+# # Path to export our NAIP-derived tree points
+# outTreePoints_NAIP <- 
+
+```
+
+
+## Read Data
+With our input and output data paths set, let's now load in our data. Let's start with the plot-level, lidar-derived CHM's: 
+```{r}
+# List the lidar-derived plots within the folder
+lidarPlotCHM_names <- list.files(pathLidarPlots, pattern = "\\.tif$", full.names = TRUE)
+
+# Now read the rasters as a list
+lidarPlotRasters <- lapply(lidarPlotCHM_names, rast)
+
+```
+
+Plot one to make sure it loaded correctly
+```{r}
+plot(lidarPlotRasters[[1]])
+
+```
+
+Now, read the site-level NAIP-derived CHMs:
+```{r}
+# List the NAIP-derived CHM sites
+NAIPSitesCHM_names <- list.files(pathNAIPsites, pattern = "\\.tif$", full.names = TRUE)
+
+# Now read the rasters as a list
+NAIPSiteRasters <- lapply(NAIPSitesCHM_names, rast)
+
+```
+
+We won't plot the full NAIP CHM raster, but be sure there are 18 that loaded in
+
+Finally, let's load in the rest of our data that we need:
+
+```{r}
+# Read plot field data
+plotData <- read.csv(pathPlotData)
+
+# Read tree data
+treeData <- read.csv(pathTreeData)
+
+# Read biomass equations
+biomassEquations <- read.csv(pathAGBData)
+```
+
+The plotData table contains the unique plot identification and GPS boundaries of the 180 field plots that were collected during the field campaign
+```{r}
+head(plotData)
+```
+
+The treeData table contains all the unique trees that were collected throughout the 180 field plots. 
+```{r}
+head(treeData)
+```
+
+Finally, the biomassEquations table hosts species specific biomass equations for 158 tree species. We'll apply these equations to the individual trees that were collected throughout the field campaign, which we can then summarize to get accurate plot-level AGB estimates. 
+
+## Apply Biomass Equations to Field Data
+Let's apply the biomass equations. What we're doing is using AGB-allometry to apply the species specific biomass equations to every tree that was collected within the field campaign. 
+
+```{r}
+# In the tree data table, alter the species column
+treeData <- treeData |>
+  rename(Species = tree_sp)
+
+# In the biomass equations table, alter the species column so it matches with the tree table
+biomassEquations <- biomassEquations |>
+  rename(Species = plants.code)
+
+# Join the tree data to the biomass equations by Species column
+treeData <- left_join(treeData, biomassEquations, by = "Species")
+
+# Now estimate biomass for the field data trees by applying the biomass equations
+treeData <- treeData |>
+  mutate(tree_biomass_kg = exp(beta.0 + beta.1 * log(tree_diam)))
+
+# Remove outliers for plotting purposes
+treeData_filtered <- treeData |>
+  filter(tree_diam < 200)
+
+# Now plot the biomass of the field data trees and color by species
+ggplot2::ggplot(treeData_filtered, aes(x = tree_diam, y = tree_biomass_kg, color = Species)) +
+  geom_point() +
+  labs(
+    title = "Tree Biomass by Diameter at Breast Height (DBH)",
+    x = "Diameter at Breast Height (cm)", 
+    y = "Biomass (kg)") +
+  theme_minimal()
+```
+
+## Create Field Plot Extents
+Now let's create our field plot extents. Our plotData table has the coordinates of the GPS points for our plot boundaries. We'll coerce that into a geometric figure using those points.
+
+```{r}
+# Create function to make one polygon the four sides of each field plot extent
+createFieldPlotExtents <- function(row) {
+  coords <- matrix(c(
+    row$plot_ne_x, row$plot_ne_y,
+    row$plot_se_x, row$plot_se_y,
+    row$plot_sw_x, row$plot_sw_y,
+    row$plot_nw_x, row$plot_nw_y,
+    row$plot_ne_x, row$plot_ne_y
+  ), ncol = 2, byrow = TRUE)
+  st_polygon(list(coords))
+}
+
+# Go through each row of the plot data spreadsheet and create the field plot extents
+fieldPlots_extents <- plotData |>
+  rowwise() |>
+  mutate(geometry = st_sfc(createFieldPlotExtents(pick(everything())))) |>
+  ungroup()
+
+# Set the current CRS and reproject
+fieldPlots_extents <- st_as_sf(fieldPlots_extents, crs = 4326) |>
+  st_transform(32612)
+
+```
+
+We now have field plot extents for each one of our 180 field plots. These boundaries will serve as the spatial boundaries for performing individual tree detection. 
+
+## Sum the Plot-Level Biomass
+Now we can use the field extents and the individual tree AGB estimates to get plot-level AGB estimates for each of the 180 field plots.
+
+```{r}
+# Return just the plot ID's from the field plot data
+plot_ids <- unique(fieldPlots_extents$plot_id)
+
+# Subset the tree data to just the unique plot names
+treeDataInPlots_raw <- treeData[treeData$plot_id %in% plot_ids, ]
+
+# FIX THE ERROR IN LAT/LONG ASSIGNMENT:
+treeDataInPlots_fixed <- treeDataInPlots_raw %>%
+  mutate(
+    # start by assuming they are correct
+    lon = tree_x,
+    lat = tree_y,
+
+    # identify likely swapped rows:
+    # lon should be negative ~ -180..0 and lat should be positive ~ 0..90
+    swapped = (tree_x > 0 & tree_x < 90) & (tree_y < 0 & tree_y > -180),
+
+    # for swapped rows, flip them
+    lon = if_else(swapped, tree_y, lon),
+    lat = if_else(swapped, tree_x, lat)
+  )
+
+# Convert the treeDataInPlots to a spatial object
+treeDataInPlots_fixed <- st_as_sf(treeDataInPlots_fixed,
+                            coords = c("lon", "lat"), 
+                            crs = 4326,
+                            remove = FALSE)
+
+# Now transform to UTM Zone 12N
+treeDataInPlots <- st_transform(treeDataInPlots_fixed, 32612)
+
+# Estimate Biomass Summary for each plot
+plotLevelBiomass <- treeDataInPlots |>
+  group_by(plot_id) |>
+  summarise(
+    total_biomass = sum(tree_biomass_kg, na.rm = TRUE),
+    mean_biomass = mean(tree_biomass_kg, na.rm = TRUE),
+    n_trees_GPS = n(),
+    .groups = 'drop'
+  )
+
+```
+
+Thus far, we've applied AGB equations to our field data trees and summarized those values at the plot-level to get total AGB for each of the 180 field plots. 
+
+## Crop Canopy Height Models to Field Plot Extents: 
+We'll now crop both sources of CHM data to match the field plot extents, which we'll subsequently use to run tree detection.
+
+We'll loop through each of the 18 site-level NAIP-derived CHMs and clip them to the extent of the 180 field plots. We'll also be sure to apply a 10-m buffer to each plot extent to ensure we properly capture every tree crown that was collected from the field data
+
+```{r}
+# Store the results as a list
+allPlotsCHMs_NAIP <- list()
+
+# Loop through the list of 18 sites
+for (i in seq_along(NAIPSiteRasters)) {
+
+  # Create message
+  # message("Processing site: ", siteNames[i])
+  
+  # Select a single site-level raster
+  chm <- NAIPSiteRasters[[i]]
+
+  # Create one polygon from raster extent
+  chm_poly <- st_as_sf(as.polygons(ext(chm), crs = crs(chm)))
+
+  # Ensure proper projection
+  fieldPlots_extents <- st_transform(fieldPlots_extents, crs(chm_poly))
+
+  # This returns a true / false matrix of whether or not a CHM intersects with the field plot extent
+  idx <- st_intersects(fieldPlots_extents, chm_poly, sparse = FALSE)
+  
+  # Extracts the plot which intersects the CHM
+  plot_rows <- which(idx)
+  
+  # Subsets the field plot extents to just those which intersect the site CHM
+  plots_in_tile <- fieldPlots_extents[plot_rows, ]
+
+  # If no plots intersect, skip to the next:
+  if (nrow(plots_in_tile) == 0) next
+
+  # Loops through each row of the field plot extent that intersected the site CHM
+  for (j in 1:nrow(plots_in_tile)) {
+  
+    # Selects a single plot 
+    plot_sf <- plots_in_tile[j, ]
+
+    # Create a 10m buffer
+    plot_sf_buf <- st_buffer(plot_sf, dist = 10)
+
+    # Convert sf to a spatvector
+    plot_vect <- vect(plot_sf_buf)
+
+    # Store plot name
+    plot_name <- plot_sf$plot_id
+
+    # Clip the CHM
+    clipped <- crop(chm, plot_vect) |>
+      mask(plot_vect)
+
+    # Add to list with plot name
+    allPlotsCHMs_NAIP[[plot_name]] <- clipped
+
+    # # Build output filename
+    # out_name <- file.path(outClippedPlots_NAIP, paste0(plot_sf$plot_id, ".tif"))
+    # 
+    # # Now write the raster
+    # writeRaster(clipped, out_name, overwrite = TRUE)
+  }
+}
+
+# Save the names of the final NAIP plots
+NAIP_PlotNames <- names(allPlotsCHMs_NAIP)
+
+```
+
+Repeat the process for the plot-level lidar-derived CHMs
+
+```{r}
+# Store the results as a list
+allPlotCHMs_Lidar <- list()
+
+# Reproject field plots once if you want, or inside loop per raster
+for (i in seq_along(lidarPlotRasters)) {
+  
+  # Select a single site-level raster
+  chm <- lidarPlotRasters[[i]]
+  
+  if (is.null(chm)) next
+  
+  # Create one polygon from raster extent
+  chm_poly <- st_as_sf(as.polygons(ext(chm), crs = crs(chm)))
+  
+  # Reproject field plots to match this raster
+  fieldPlots_proj <- st_transform(fieldPlots_extents, crs(chm_poly))
+  
+  # Which plots intersect this CHM extent
+  idx <- st_intersects(fieldPlots_proj, chm_poly, sparse = FALSE)
+  plot_rows <- which(idx[, 1])
+  
+  # Subset to intersecting plots
+  plots_in_tile <- fieldPlots_proj[plot_rows, ]
+  
+  # Skip if none intersect
+  if (nrow(plots_in_tile) == 0) next
+  
+  # Loop through intersecting plots
+  for (j in seq_len(nrow(plots_in_tile))) {
+    
+    plot_sf <- plots_in_tile[j, ]
+    
+    # Make valid just in case
+    plot_sf <- st_make_valid(plot_sf)
+    
+    # Create a 10m buffer 
+    plot_sf_buf <- st_buffer(plot_sf, dist = 10)
+    
+    # Convert sf to SpatVector
+    plot_vect <- vect(plot_sf_buf)
+    
+    # Extra safety check before crop
+    if (!relate(ext(chm), ext(plot_vect), relation = "intersects")) {
+      message("No raster overlap for plot: ", plot_sf$plot_id)
+      next
+    }
+    
+    # Store plot name
+    plot_name <- plot_sf$plot_id
+    
+    # Clip the CHM
+    clipped <- tryCatch(
+      crop(chm, plot_vect) |> mask(plot_vect),
+      error = function(e) {
+        message("Crop/mask failed for plot ", plot_name, ": ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(clipped)) next
+    
+    # Add to list with plot name
+    allPlotCHMs_Lidar[[plot_name]] <- clipped
+    
+    # # Build output filename
+    # out_name <- file.path(outClippedPlots_Lidar, paste0("lidar_", plot_name, ".tif"))
+    # 
+    # # Write the raster
+    # writeRaster(clipped, out_name, overwrite = TRUE)
+  }
+}
+
+# Save the names
+Lidar_PlotNames <- names(allPlotCHMs_Lidar)
+
+```
+
+Now that we have CHM's, we'll perform individual tree detection for both the NAIP-derived and Lidar-derived CHMs. 
+
+The chunk below is for tuning the tree detection and segmentation parameters for a single plot for the NAIP-derived CHM. 
+
+```{r}
+
+## PARAM 1: Variable window size 
+h <- function(x) {
+  cw <- 1.0827 * x - 0.3993
+  ws <- pmin(10, pmax(3, cw/2))
+  return(ws)
+}
+
+## PARAM 2: Max pixel height for crown segmentation
+# The default is 2
+# Threshold below which a pixel cannot be a tree
+th_tree_NAIP  = 0.5
+
+## PARAM 3: Growing Threshold 1: 
+# A pixel is added to a region if its height is greater than the tree height multiplied by this value
+# The default is = 0.45
+# At 0.45, pixels must be at least 45% as tall as the tree top to be included in the crown
+th_seed_NAIP  = 0.35
+
+# PARAM 4: Growing Threshold 2: 
+# A pixel is added to a region if its height is greater than the current mean height of the region multiplied by this value
+# The default is = 0.55
+# Low values = looser crowns, possible merging
+# High values = stricter boundaries, possible over-segmentation
+th_cr_NAIP    = 0.6
+
+# PARAM 5: Maximum value of the crown diameter.
+# DEFAULT = 10
+max_cr_NAIP = 15
+
+### END USER INPUT -------------------------------------------------------------
+# Select the CHM name you want to test tree detection on
+chm_name <- names(allPlotsCHMs_NAIP)[1]
+
+# Run Tree Detection on a single NAIP CHM
+chm_test <- allPlotsCHMs_NAIP[[chm_name]]
+
+# Reproject
+chm_test <- project(chm_test, "EPSG:32612")
+
+# Locate trees
+ttops <- locate_trees(chm_test, lmf(ws = h, hmin = 0.5))
+
+# Convert to sf 
+ttops_sf <- st_as_sf(ttops)
+
+# Perform Crown Segmentation
+crowns_id <- tryCatch(
+    dalponte2016(
+      chm      = chm_test,
+      treetops = ttops_sf,
+
+      # Threshold below which a pixel cannot be a tree
+      # DEFAULT = 2
+      th_tree  = th_tree_NAIP,
+
+      # Growing Threshold 1: A pixel is added to a region if its height is
+      # greater than the tree height multiplied by this value
+      
+      # DEFAULT = 0.45
+      # At 0.45, pixels must be at least 45% as tall as the tree top to be included in the crown
+      th_seed  = th_seed_NAIP,
+
+      # Growing Threshold 2: A pixel is added to a region if its height is
+      # greater than the current mean height of the region multiplied by this value
+      # DEFAULT = 0.55
+      # Low values = looser crowns, possible merging
+      # High values = stricter boundaries, possible over-segmentation
+      th_cr    = th_cr_NAIP,
+
+      # Maximum value of the crown diameter.
+      # DEFAULT = 10
+      max_cr = max_cr_NAIP
+      )(), 
+      
+    # Throw this error if crown segmentation fails
+    error = function(e) {
+      message("Dalponte CHM-only failed: ", e$message); NULL
+      }
+  )
+
+# Convert crown segmentation raster to a SpatRaster
+crowns_id <- tryCatch(
+    terra::rast(crowns_id),
+    error = function(e) { message("Conversion to SpatRaster failed: ", e$message); NULL }
+)
+
+
+# Now convert SpatRaster to polygon
+crowns_poly <- tryCatch(
+    terra::as.polygons(crowns_id, dissolve = TRUE, na.rm = TRUE),
+    error = function(e) { message("as.polygons failed: ", e$message); NULL }
+)
+
+# Store names as treeID
+names(crowns_poly) <- "treeID"
+
+# Clean up the oblong crown shapes by buffering in and out, then simplifying
+crowns_poly <- buffer(crowns_poly, -1 * res(chm_test)[1]) |>
+  buffer(1 * res(chm_test)[1]) |>
+  simplifyGeom(res(chm_test)[1] / 4)
+
+# Drop empty / invalid geometries
+crowns_poly <- crowns_poly[!terra::is.empty(crowns_poly), ]
+
+if (nrow(crowns_poly) == 0) return(NULL)
+
+# Calculate Crown Area in m2
+crowns_poly$area_m2 <- terra::expanse(crowns_poly, unit = "m")
+
+# Extract the maximum height for each crown polygon
+zmax <- terra::extract(chm_test, crowns_poly, fun = max, na.rm = TRUE)
+  
+# Assign the maximum height to the crown polygons
+crowns_poly$tree_height_m <- zmax[,2]
+
+# Convert to sf 
+crowns_sf <- sf::st_as_sf(crowns_poly)
+
+# Transform
+ttops_sf <- st_transform(ttops_sf, st_crs("EPSG:32612"))
+crowns_sf <- st_transform(crowns_sf, st_crs("EPSG:32612"))
+fieldPlots_extents <- st_transform(fieldPlots_extents, st_crs("EPSG:32612"))
+
+# Add plot ID
+crowns_sf$plotID <- chm_name
+ttops_sf$plotID <- chm_name
+
+# Keep only the tree points that fall within the field plot extents
+ttops_in_plots <- ttops_sf[
+  lengths(st_within(ttops_sf, fieldPlots_extents)) > 0,
+]
+
+# Filter only the tree crowns which have an associated tree top that falls within the field plot extents
+keys <- ttops_in_plots %>%
+  st_drop_geometry() %>%
+  distinct(plotID, treeID)
+
+# Subset to only the crowns we want to keep
+ttops_sf <- ttops_sf %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+# Get the field plot extent
+plot_extent <- fieldPlots_extents |>
+  filter(plot_id == chm_name)
+
+# Plot the results
+plot(chm_test)
+plot(ttops_sf,
+     col = "white",
+     lwd = 4, 
+     add = TRUE)
+plot(st_geometry(crowns_sf), 
+     add = TRUE, 
+     fill = NA, 
+     border = "red",
+     lwd = 2)
+plot(st_geometry(plot_extent),
+    add = TRUE,
+    border = "red",
+    lwd = 2)
+
+
+```
+### TEMPORARY SCRIPT FROM MICKEY:
+```{r}
+library(lidR)
+library(terra)
+library(foreach)
+library(doParallel)
+library(sf)
+
+#---------------params
+main_dir <- "S:/ursa/campbell/mort_frp/data/fires/creek_fire_2020_ca"
+ncores <- 16L # best to use a square number
+temp_dir <- "E:/Mickey/TEMP"
+min_npix <- 5
+#---------------params
+
+# directory structure
+chm_dir <- file.path(main_dir, "chm")
+crown_dir <- file.path(main_dir, "crowns")
+
+# list inputs and loop through them
+chm_files <- list.files(chm_dir, "*.tif$")
+scene_ids <- sub("\\_chm.tif$", "", chm_files)
+for (scene_id in scene_ids){
+
+  # print status
+  print(paste0(date(), " ", scene_id))
+
+  # define output and see if it has already been run
+  out_file <- file.path(crown_dir, paste0(scene_id, "_crowns.gpkg"))
+  if (file.exists(out_file)) next
+
+  # read in the data
+  chm_file <- file.path(chm_dir, paste0(scene_id, "_chm.tif"))
+  chm <- rast(chm_file)
+
+  # create tiling grid
+  zones <- rast(
+    nrows = sqrt(ncores),
+    ncols = sqrt(ncores),
+    ext = ext(chm),
+    crs = crs(chm)
+  )
+  values(zones) <- 1:ncores
+
+  # get grid as vector
+  core_exts <- getTileExtents(chm, zones, buffer = 0)
+
+  # create temporary tile directory
+  tile_dir <- file.path(temp_dir, paste0("tiles", scene_id))
+  if (dir.exists(tile_dir)){
+    try(unlink(tile_dir, recursive = T, force = T))
+  }
+  dir.create(tile_dir)
+
+  # create tiles
+  tiles <- makeTiles(
+    x = chm,
+    y = zones,
+    buffer = 10,
+    filename = file.path(tile_dir, "tile_.tif"),
+    overwrite = T
+  )
+
+  # begin parallelization
+  cl <- makeCluster(ncores)
+  doParallel::registerDoParallel(cl)
+  on.exit(stopCluster(cl), add = T)
+
+  # begin foreach loop
+  result <- foreach(
+    i = seq_along(tiles),
+    .combine = "c",
+    .packages = c("lidR", "terra", "sf"),
+    .errorhandling = "pass"
+  ) %dopar% {
+
+    # read in the data
+    chm_tile <- rast(tiles[i])
+
+    # get into meters
+    chm_tile <- chm_tile / 100
+
+    # define variable window size function
+    ws_fun <- function(h) pmin(7, pmax(2.5, 0.04 * h + 2.25))
+
+    # set lidr threads
+    set_lidr_threads(1L)
+
+    # locate tree tops
+    ttops <- locate_trees(
+      las = chm_tile, 
+      algorithm = lmf(
+        ws = ws_fun, 
+        hmin = 4, 
+        shape = "circular"
+      )
+    )
+
+    # get core extent
+    core_ext <- core_exts[i,]
+    core_bbox <- st_bbox(c(
+      xmin = core_ext[[1]],
+      ymin = core_ext[[3]],
+      xmax = core_ext[[2]],
+      ymax = core_ext[[4]]
+    ), crs = st_crs(ttops))
+
+    # select only the treetops that fall in the core area
+    ttops <- st_crop(ttops, core_bbox)
+    if (nrow(ttops) == 0) return(NULL)
+
+    # delineate crowns
+    algo <- dalponte2016(
+      chm = chm_tile,
+      treetops = ttops,
+      th_tree = 4,
+      th_seed = 0.45,
+      th_cr   = 0.55,
+      max_cr  = 35
+    )
+    crowns <- algo()
+
+    # filter out small polygons
+    crowns_freq <- freq(crowns)
+    keep_ids <- crowns_freq$value[crowns_freq$count >= min_npix]
+    crowns <- ifel(crowns %in% keep_ids, crowns, NA)
+
+    # convert to polygon
+    crown_polys <- as.polygons(crowns)
+
+    # clean up tentacles
+    crown_polys <- buffer(crown_polys, -2 * res(chm_tile)[1]) |>
+      buffer(2 * res(chm_tile)[1]) |>
+      simplifyGeom(res(chm_tile)[1] / 4)
+    if (nrow(crown_polys) == 0) return(NULL)
+
+    # simplify attributes for rbind-ing
+    names(crown_polys) <- "id"
+
+    # write to file
+    temp_file <- file.path(tile_dir, paste0("crowns_", i, ".gpkg"))
+    writeVector(crown_polys, temp_file, overwrite = T)
+
+    # return output file name
+    return(temp_file)
+
+  }
+
+  # end parallelization
+  stopCluster(cl)
+
+  # combine
+  crowns <- do.call(
+    rbind, 
+    lapply(
+      result, 
+      function(x){
+        if (endsWith(x, ".gpkg")) vect(x)
+      }
+    )
+  )
+
+  # write to files
+  writeVector(crowns, out_file, overwrite = T)
+
+  # try to delete the tile directory
+  rm(crowns, result, chm)
+  terra::tmpFiles(remove = T)
+  gc(); gc()
+  try(unlink(tile_dir, recursive = T, force = T))
+
+}
+
+```
+
+Now, tune the parameters on the lidar-derived tree list
+
+```{r}
+
+## PARAM 1: Variable window size 
+h <- function(x) {
+  cw <- 1.0827 * x - 0.3993
+  ws <- pmin(10, pmax(3, cw/2))
+  return(ws)
+}
+
+## PARAM 2: Max pixel height for crown segmentation
+# The default is 2
+# Threshold below which a pixel cannot be a tree
+th_tree_lidar  = 0.5
+
+## PARAM 3: Growing Threshold 1: 
+# A pixel is added to a region if its height is greater than the tree height multiplied by this value
+# The default is = 0.45
+# At 0.45, pixels must be at least 45% as tall as the tree top to be included in the crown
+th_seed_lidar  = 0.35
+
+# PARAM 4: Growing Threshold 2: 
+# A pixel is added to a region if its height is greater than the current mean height of the region multiplied by this value
+# The default is = 0.55
+# Low values = looser crowns, possible merging
+# High values = stricter boundaries, possible over-segmentation
+th_cr_lidar    = 0.6
+
+# PARAM 5: Maximum value of the crown diameter.
+# DEFAULT = 10
+max_cr_lidar = 15
+
+### END USER INPUT -------------------------------------------------------------
+# Select the CHM name you want to test tree detection on
+chm_name <- "UOFU_AZCV_P04"
+
+# Run Tree Detection on a single NAIP CHM
+chm_test <- allPlotCHMs_Lidar[[chm_name]]
+
+# Reproject
+chm_test <- project(chm_test, "EPSG:32612")
+
+# Locate trees
+ttops <- locate_trees(chm_test, lmf(ws = h, hmin = 0.5))
+
+# Convert to sf 
+ttops_sf <- st_as_sf(ttops)
+
+# Perform Crown Segmentation
+crowns_id <- tryCatch(
+    dalponte2016(
+      chm      = chm_test,
+      treetops = ttops_sf,
+
+      # Threshold below which a pixel cannot be a tree
+      # DEFAULT = 2
+      th_tree  = th_tree_lidar,
+
+      # Growing Threshold 1: A pixel is added to a region if its height is
+      # greater than the tree height multiplied by this value
+      
+      # DEFAULT = 0.45
+      # At 0.45, pixels must be at least 45% as tall as the tree top to be included in the crown
+      th_seed  = th_seed_lidar,
+
+      # Growing Threshold 2: A pixel is added to a region if its height is
+      # greater than the current mean height of the region multiplied by this value
+      # DEFAULT = 0.55
+      # Low values = looser crowns, possible merging
+      # High values = stricter boundaries, possible over-segmentation
+      th_cr    = th_cr_lidar,
+
+      # Maximum value of the crown diameter.
+      # DEFAULT = 10
+      max_cr = max_cr_lidar
+      )(), 
+      
+    # Throw this error if crown segmentation fails
+    error = function(e) {
+      message("Dalponte CHM-only failed: ", e$message); NULL
+      }
+  )
+
+# Convert crown segmentation raster to a SpatRaster
+crowns_id <- tryCatch(
+    terra::rast(crowns_id),
+    error = function(e) { message("Conversion to SpatRaster failed: ", e$message); NULL }
+)
+
+
+# Now convert SpatRaster to polygon
+crowns_poly <- tryCatch(
+    terra::as.polygons(crowns_id, dissolve = TRUE, na.rm = TRUE),
+    error = function(e) { message("as.polygons failed: ", e$message); NULL }
+)
+
+# Store names as treeID
+names(crowns_poly) <- "treeID"
+
+# Clean up the oblong crown shapes by buffering in and out, then simplifying
+crowns_poly <- buffer(crowns_poly, -1 * res(chm_test)[1]) |>
+  buffer(1 * res(chm_test)[1]) |>
+  simplifyGeom(res(chm_test)[1] / 4)
+
+# Drop empty / invalid geometries
+crowns_poly <- crowns_poly[!terra::is.empty(crowns_poly), ]
+
+if (nrow(crowns_poly) == 0) return(NULL)
+
+# Calculate Crown Area in m2
+crowns_poly$area_m2 <- terra::expanse(crowns_poly, unit = "m")
+
+# Extract the maximum height for each crown polygon
+zmax <- terra::extract(chm_test, crowns_poly, fun = max, na.rm = TRUE)
+  
+# Assign the maximum height to the crown polygons
+crowns_poly$tree_height_m <- zmax[,2]
+
+# Convert to sf 
+crowns_sf <- sf::st_as_sf(crowns_poly)
+
+# Transform
+ttops_sf <- st_transform(ttops_sf, st_crs("EPSG:32612"))
+crowns_sf <- st_transform(crowns_sf, st_crs("EPSG:32612"))
+fieldPlots_extents <- st_transform(fieldPlots_extents, st_crs("EPSG:32612"))
+
+# Add plot ID
+crowns_sf$plotID <- chm_name
+ttops_sf$plotID <- chm_name
+
+# Keep only the tree points that fall within the field plot extents
+ttops_in_plots <- ttops_sf[
+  lengths(st_within(ttops_sf, fieldPlots_extents)) > 0,
+]
+
+# Filter only the tree crowns which have an associated tree top that falls within the field plot extents
+keys <- ttops_in_plots %>%
+  st_drop_geometry() %>%
+  distinct(plotID, treeID)
+
+# Subset to only the crowns we want to keep
+ttops_sf <- ttops_sf %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+crowns_sf <- crowns_sf %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+# Get the field plot extent
+plot_extent <- fieldPlots_extents |>
+  filter(plot_id == chm_name)
+
+# Plot the results
+plot(chm_test)
+plot(ttops_sf,
+     col = "white",
+     lwd = 4, 
+     add = TRUE)
+plot(st_geometry(crowns_sf), 
+     add = TRUE, 
+     fill = NA, 
+     border = "red",
+     lwd = 2)
+plot(st_geometry(plot_extent),
+    add = TRUE,
+    border = "red",
+    lwd = 2)
+
+
+```
+
+Once satisfied for parameters, run individual tree detection across the 180 plots for the NAIP-derived Canopy Height Models:
+
+```{r}
+# Store tree tops and crowns as a list
+NAIP_treePoints_list <- list()
+NAIP_treeCrowns_list <- list()
+
+# Loop through each plot CHM and run tree detection
+for (plot_id in NAIP_PlotNames) {
+
+  message("Processing plot: ", plot_id)
+
+  # Select a single plot CHM
+  chm <- allPlotsCHMs_NAIP[[plot_id]]
+
+  if (is.null(chm)) {
+    message("CHM is NULL for plot: ", plot_id)
+    next
+  }
+
+  # Ensure proper projection
+  chm <- terra::project(chm, "EPSG:32612")
+
+  # Identify Tree Tops
+  ttops <- tryCatch(
+    locate_trees(chm, lmf(ws = h, hmin = 0.5)),
+    error = function(e) {
+      message("Treetops failed: ", e$message)
+      NULL
+    }
+  )
+
+  # Skip if no treetops
+  if (is.null(ttops) ||
+      (inherits(ttops, "data.frame") && nrow(ttops) == 0) ||
+      (inherits(ttops, "sf") && nrow(ttops) == 0) ||
+      (inherits(ttops, "SpatVector") && terra::nrow(ttops) == 0)) {
+    message("No treetops detected for plot: ", plot_id)
+    next
+  }
+
+  # Convert to sf object
+  ttops_sf <- tryCatch(
+    st_as_sf(ttops),
+    error = function(e) {
+      message("st_as_sf failed: ", e$message)
+      NULL
+    }
+  )
+
+  if (is.null(ttops_sf) || nrow(ttops_sf) == 0) {
+    message("No valid treetop sf object for plot: ", plot_id)
+    next
+  }
+
+  # Run crown segmentation
+  crowns_id <- tryCatch(
+    dalponte2016(
+      chm      = chm,
+      treetops = ttops_sf,
+      th_tree  = th_tree_NAIP,
+      th_seed  = th_seed_NAIP,
+      th_cr    = th_cr_NAIP,
+      max_cr   = max_cr_NAIP
+    )(),
+    error = function(e) {
+      message("Dalponte CHM-only failed: ", e$message)
+      NULL
+    }
+  )
+
+  if (is.null(crowns_id)) {
+    message("No crown raster returned for plot: ", plot_id)
+    next
+  }
+
+# Convert crown segmentation raster to a SpatRaster
+crowns_id <- tryCatch(
+    terra::rast(crowns_id),
+    error = function(e) { message("Conversion to SpatRaster failed: ", e$message); NULL }
+)
+
+
+# Now convert SpatRaster to polygon
+crowns_poly <- tryCatch(
+    terra::as.polygons(crowns_id, dissolve = TRUE, na.rm = TRUE),
+    error = function(e) { message("as.polygons failed: ", e$message); NULL }
+)
+
+
+  if (is.null(crowns_poly) || terra::nrow(crowns_poly) == 0) {
+    message("No crown polygons for plot: ", plot_id)
+    next
+  }
+
+  # Store names as treeID
+  names(crowns_poly) <- "treeID"
+  
+  # Clean up the oblong crown shapes by buffering in and out, then simplifying
+  crowns_poly <- buffer(crowns_poly, -2 * res(chm_test)[1]) |>
+    buffer(2 * res(chm_test)[1]) |>
+    simplifyGeom(res(chm_test)[1] / 4)
+
+  # Drop empty / invalid geometries
+  crowns_poly <- crowns_poly[!terra::is.empty(crowns_poly), ]
+
+if (nrow(crowns_poly) == 0) return(NULL)
+
+  # Calculate Crown Area in m2
+  crowns_poly$area_m2 <- terra::expanse(crowns_poly, unit = "m")
+
+  # Extract the maximum height for each crown polygon
+  zmax <- tryCatch(
+    terra::extract(chm, crowns_poly, fun = max, na.rm = TRUE),
+    error = function(e) {
+      message("extract failed: ", e$message)
+      NULL
+    }
+  )
+
+  if (is.null(zmax) || nrow(zmax) != terra::nrow(crowns_poly)) {
+    message("Height extraction row mismatch for plot: ", plot_id,
+            " | crowns=", terra::nrow(crowns_poly),
+            " | zmax=", ifelse(is.null(zmax), 0, nrow(zmax)))
+    next
+  }
+
+  # Assign the maximum height to the crown polygons
+  crowns_poly$tree_height_m <- zmax[,2]
+
+  # Convert to sf
+  crowns_sf <- sf::st_as_sf(crowns_poly)
+
+  # Add plot ID
+  crowns_sf$plotID <- plot_id
+  ttops_sf$plotID <- plot_id
+
+  # Store
+  NAIP_treePoints_list[[plot_id]] <- ttops_sf
+  NAIP_treeCrowns_list[[plot_id]] <- crowns_sf
+}
+
+# Bind all rows
+allTreePoints_NAIP <- dplyr::bind_rows(NAIP_treePoints_list)
+allTreeCrowns_NAIP <- dplyr::bind_rows(NAIP_treeCrowns_list)
+
+# Check projection
+allTreePoints_NAIP <- st_transform(allTreePoints_NAIP, st_crs(fieldPlots_extents))
+allTreeCrowns_NAIP <- st_transform(allTreeCrowns_NAIP, st_crs(fieldPlots_extents))
+
+# Keep only the tree points that fall within the field plot extents
+ttops_in_plots <- allTreePoints_NAIP[
+  lengths(st_within(allTreePoints_NAIP, fieldPlots_extents)) > 0,
+]
+
+# Filter only the tree crowns which have an associated tree top that falls within the field plot extents
+keys <- ttops_in_plots %>%
+  st_drop_geometry() %>%
+  distinct(plotID, treeID)
+
+# Subset to only the crowns we want to keep
+allTreeCrowns_NAIP_final <- allTreeCrowns_NAIP %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+# Subset to only the tree tops we want to keep
+allTreePoints_NAIP_final <- allTreePoints_NAIP %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+```
+
+
+Then, run tree detection on the lidar-derived CHMs
+
+```{r}
+# Store tree tops and crowns as a list
+Lidar_treePoints_list <- list()
+Lidar_treeCrowns_list <- list()
+
+# Loop through each plot CHM and run tree detection
+for (plot_id in Lidar_PlotNames) {
+
+  message("Processing plot: ", plot_id)
+
+  # Select a single plot CHM
+  chm <- allPlotCHMs_Lidar[[plot_id]]
+
+  if (is.null(chm)) {
+    message("CHM is NULL for plot: ", plot_id)
+    next
+  }
+
+  # Ensure proper projection
+  chm <- terra::project(chm, "EPSG:32612")
+
+  # Identify Tree Tops
+  ttops <- tryCatch(
+    locate_trees(chm, lmf(ws = h, hmin = 0.5)),
+    error = function(e) {
+      message("Treetops failed: ", e$message)
+      NULL
+    }
+  )
+
+  # Skip if no treetops
+  if (is.null(ttops) ||
+      (inherits(ttops, "data.frame") && nrow(ttops) == 0) ||
+      (inherits(ttops, "sf") && nrow(ttops) == 0) ||
+      (inherits(ttops, "SpatVector") && terra::nrow(ttops) == 0)) {
+    message("No treetops detected for plot: ", plot_id)
+    next
+  }
+
+  # Convert to sf object
+  ttops_sf <- tryCatch(
+    st_as_sf(ttops),
+    error = function(e) {
+      message("st_as_sf failed: ", e$message)
+      NULL
+    }
+  )
+
+  if (is.null(ttops_sf) || nrow(ttops_sf) == 0) {
+    message("No valid treetop sf object for plot: ", plot_id)
+    next
+  }
+
+  # Run Dalponte2016 tree segmentation algorithm
+  crowns_id <- tryCatch(
+    dalponte2016(
+      chm      = chm,
+      treetops = ttops_sf,
+      th_tree  = th_tree_lidar,
+      th_seed  = th_seed_lidar,
+      th_cr    = th_cr_lidar,
+      max_cr   = max_cr_lidar
+    )(),
+    error = function(e) {
+      message("Dalponte CHM-only failed: ", e$message)
+      NULL
+    }
+  )
+
+  if (is.null(crowns_id)) {
+    message("No crown raster returned for plot: ", plot_id)
+    next
+  }
+
+  # Convert crown segmentation raster to a SpatRaster
+  crowns_id <- tryCatch(
+    terra::rast(crowns_id),
+    error = function(e) { message("Conversion to SpatRaster failed: ", e$message); NULL }
+  )
+
+
+  #  Now convert SpatRaster to polygon
+  crowns_poly <- tryCatch(
+    terra::as.polygons(crowns_id, dissolve = TRUE, na.rm = TRUE),
+    error = function(e) { message("as.polygons failed: ", e$message); NULL }
+  )
+
+  if (is.null(crowns_poly) || terra::nrow(crowns_poly) == 0) {
+    message("No crown polygons for plot: ", plot_id)
+    next
+  }
+  
+  # Store names as treeID
+  names(crowns_poly) <- "treeID"
+
+  # Clean up the oblong crown shapes by buffering in and out, then simplifying
+  crowns_poly <- buffer(crowns_poly, -2 * res(chm_test)[1]) |>
+    buffer(2 * res(chm_test)[1]) |>
+    simplifyGeom(res(chm_test)[1] / 4)
+
+  # Drop empty / invalid geometries
+  crowns_poly <- crowns_poly[!terra::is.empty(crowns_poly), ]
+
+if (nrow(crowns_poly) == 0) return(NULL)
+
+  # Calculate Crown Area in m2
+  crowns_poly$area_m2 <- terra::expanse(crowns_poly, unit = "m")
+
+  # Extract the maximum height for each crown polygon
+  zmax <- tryCatch(
+    terra::extract(chm, crowns_poly, fun = max, na.rm = TRUE),
+    error = function(e) {
+      message("extract failed: ", e$message)
+      NULL
+    }
+  )
+
+  if (is.null(zmax) || nrow(zmax) != terra::nrow(crowns_poly)) {
+    message("Height extraction row mismatch for plot: ", plot_id,
+            " | crowns=", terra::nrow(crowns_poly),
+            " | zmax=", ifelse(is.null(zmax), 0, nrow(zmax)))
+    next
+  }
+
+  # Assign the maximum height to the crown polygons
+  crowns_poly$tree_height_m <- zmax[,2]
+
+  # Convert to sf 
+  crowns_sf <- sf::st_as_sf(crowns_poly)
+
+  # Add plot ID
+  crowns_sf$plotID <- plot_id
+  ttops_sf$plotID <- plot_id
+
+  # Store
+  Lidar_treePoints_list[[plot_id]] <- ttops_sf
+  Lidar_treeCrowns_list[[plot_id]] <- crowns_sf
+}
+
+# Bind all rows
+allTreePoints_Lidar <- dplyr::bind_rows(Lidar_treePoints_list)
+allTreeCrowns_Lidar <- dplyr::bind_rows(Lidar_treeCrowns_list)
+
+# Check projection
+allTreePoints_Lidar <- st_transform(allTreePoints_Lidar, st_crs(fieldPlots_extents))
+allTreeCrowns_Lidar <- st_transform(allTreeCrowns_Lidar, st_crs(fieldPlots_extents))
+
+# Keep only the tree points that fall within the field plot extents
+ttops_in_plots <- allTreePoints_Lidar[
+  lengths(st_within(allTreePoints_Lidar, fieldPlots_extents)) > 0,
+]
+
+# Filter only the tree crowns which have an associated tree top that falls within the field plot extents
+keys <- ttops_in_plots %>%
+  st_drop_geometry() %>%
+  distinct(plotID, treeID)
+
+# Subset to only the crowns we want to keep
+allTreeCrowns_Lidar_final <- allTreeCrowns_Lidar %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+# Subset to only the tree tops we want to keep
+allTreePoints_Lidar_final <- allTreePoints_Lidar %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+```
+
+We've now detected tree tops and delineated tree crowns for both the NAIP-derived and Lidar-Derived CHM.
+
+Let's check the results for a single NAIP-derived CHM and its corresponding Lidar-derived CHM, along with the field data for the same plot.
+
+```{r}
+# What's the name of the CHM you want to check?
+chm_name <- "UOFU_AZCV_P04"
+
+# Get the single NAIP CHM
+chm_NAIP <- allPlotsCHMs_NAIP[[chm_name]]
+
+# Get the single Lidar CHM
+chm_Lidar <- allPlotCHMs_Lidar[[chm_name]]
+
+# Subset the NAIP tree points to selected plot
+treePoints_NAIP <- allTreePoints_NAIP_final |> 
+  filter(plotID == chm_name)
+
+# Subset the NAIP tree crowns to the selected plot
+treeCrowns_NAIP <- allTreeCrowns_NAIP_final |>
+  filter(plotID == chm_name)
+
+# Subset the Lidar tree points to the selected plot
+treePoints_Lidar <- allTreePoints_Lidar_final |> 
+  filter(plotID == chm_name)
+
+# Subset the lidar tree crowns to the selected plot
+treeCrowns_Lidar <- allTreeCrowns_Lidar_final |>
+  filter(plotID == chm_name)
+
+# Get the GPS tree points for the plot
+fieldTrees <- treeDataInPlots %>%
+  filter(plot_id == chm_name)
+
+# Get the field plot extent 
+plot_extent <- fieldPlots_extents |>
+  filter(plot_id == chm_name)
+
+```
+
+Map the NAIP layers: 
+
+```{r}
+mapview(
+  chm_NAIP,
+  layer.name = "NAIP CHM",
+  col.regions = colorRampPalette(c("red", "yellow", "green"))
+) +
+  mapview(treePoints_NAIP, color = "blue", layer.name = "NAIP Tree Tops") +
+  mapview(
+    treeCrowns_NAIP,
+    color = "red",
+    lwd = 3,
+    fill = NA,
+    layer.name = "NAIP Crowns"
+  ) +
+  mapview(
+    fieldTrees,
+    color = "black",
+    col.regions = "white",
+    cex = 2,
+    alpha = 1,
+    layer.name = "Field Trees"
+  ) +
+  mapview(st_geometry(plot_extent), color = "blue", lwd = 3, fill = NA, layer.name = "Plot Extent")
+
+```
+
+Now plot the lidar data
+```{r}
+mapview(
+  chm_Lidar,
+  layer.name = "Lidar CHM",
+  col.regions = colorRampPalette(c("red", "yellow", "green"))
+) +
+  mapview(treePoints_Lidar, color = "blue", layer.name = "Lidar Tree Tops") +
+  mapview(
+    treeCrowns_Lidar,
+    color = "red",
+    lwd = 3,
+    fill = NA,
+    layer.name = "Lidar Crowns"
+  ) +
+  mapview(
+    fieldTrees,
+    color = "black",
+    col.regions = "white",
+    cex = 2,
+    alpha = 1,
+    layer.name = "Field Trees"
+  ) +
+  mapview(st_geometry(plot_extent), color = "blue", fill = NA, layer.name = "Plot Extent")
+
+
+
+```
+
+## Model Biomass of Individual Trees
+
+We'll now use the metrics associated with the detected trees (tree height & crown area) to run numerical optimization. In essence, the individual tree-level predictor coefficients are tuned to minimize the sum of squared errors between the predicted plot-level biomass (sum of tree-level biomass) and the observed plot-level biomass from the field data.
+
+Let's run it on the NAIP-derived tree list: 
+
+```{r}
+# Create tree and plot df
+df_tree <- allTreeCrowns_NAIP_final
+df_plot <- plotLevelBiomass
+
+# Select tree variables
+df_tree <- df_tree[,c("plotID", "tree_height_m", "area_m2")]
+df_tree <- st_drop_geometry(df_tree)
+
+# Select plot variables
+df_plot <- df_plot[,c("plot_id", "total_biomass")]
+df_plot <- st_drop_geometry(df_plot)
+
+# Subset data to these variables
+colnames(df_tree) <- c("plot_id", "tree_height", "tree_area")
+colnames(df_plot) <- c("plot_id", "plot_biomass")
+
+# Merge the data
+df <- merge(df_plot, df_tree)
+
+# Split into list by plot
+plot_ids <- unique(df$plot_id)
+tree_list <- split(df, df$plot_id)
+
+# Extract the observed plot biomass
+plot_biomass <- tapply(df$plot_biomass, df$plot_id, FUN = function(x) x[1])
+
+# Define a predictive allometric model
+predict_plot_biomass <- function(params) {
+  a <- params[1]
+  b <- params[2]
+  c <- params[3]
+  # d <- params[4]
+  
+  pred <- numeric(length(tree_list))
+  names(pred) <- names(tree_list)
+  
+  for(i in seq_along(tree_list)) {
+    trees <- tree_list[[i]]
+    
+    # Equation 1: Power Law
+    tree_vals <- a * (trees$tree_height^b) * (trees$tree_area^c)
+    
+    # Equation 2: Additive 
+    # tree_vals <- a + b * trees$tree_height + c * trees$tree_area
+    
+    # Equation 3: Additive non-linear
+    # tree_vals <- a * (trees$tree_height^b) + c * (trees$tree_area^d)
+    
+    # Equation 4: Just tree height
+    # tree_vals <- a * (trees$tree_height^b)
+    
+    # Equation 5: Just crown area
+    # tree_vals <- a * (trees$tree_area^b)
+    
+    pred[i] <- sum(tree_vals, na.rm = TRUE)
+  }
+  
+  pred
+}
+
+# Define the objective function (sum of squared errors)
+objective <- function(params) {
+  pred <- predict_plot_biomass(params)
+  # ensure ordering matches
+  resid <- plot_biomass - pred[names(plot_biomass)]
+  sum(resid^2)
+}
+
+# Fit the model through numerical optimization
+start_vals <- c(a = 0.1, 
+                b = 1, 
+                c = 1
+)
+
+# Fit the parameters
+fit <- optim(
+  par = 
+    start_vals,
+  fn = objective,
+  
+  # Broyden, Fletcher, Goldfarb, and Shanno
+  # Uses function values and gradients to build up a picture of the surface to be optimized
+  method = "L-BFGS-B",
+  lower = c(1e-6, 
+            -5,
+            -5),
+  upper = c(100,  
+            5,
+            5))
+
+# Whats here?
+# The best set of parameters found
+# The coefficients for individual tree level biomass! 
+fit$par 
+
+# Return the predicted biomass
+predicted <- predict_plot_biomass(fit$par)
+print(predicted)
+
+# Create a dataframe of the predicted biomass
+predicted_df <- as.data.frame(predicted)
+predicted_df$PlotID <- rownames(predicted_df)
+rownames(predicted_df) <- NULL
+
+# Create a dataframe of the measured plot biomass
+observed_df <- as.data.frame(plot_biomass)
+observed_df$PlotID <- rownames(observed_df)
+rownames(observed_df) <- NULL
+
+# Join the two biomass estimates
+final_df <- left_join(predicted_df, observed_df, by = "PlotID")
+
+# scatterplot
+plot(plot_biomass, predicted,
+     xlab = "Observed plot biomass",
+     ylab = "Predicted plot biomass")
+abline(0, 1, col = "red")
+
+# Observed and predicted vectors
+obs <- plot_biomass
+pred <- predicted[names(plot_biomass)]   
+
+# 1. Root Mean Squared Error
+RMSE <- sqrt(mean((obs - pred)^2))
+print(RMSE)
+
+# 2. Mean Absolute Error
+MAE <- mean(abs(obs - pred))
+print(MAE)
+
+# 3. Bias (signed error)
+Bias <- mean(pred - obs)
+
+# 4. Mean Absolute Percent Error
+MAPE <- mean(abs((obs - pred) / obs)) * 100
+
+# 5. R-squared (coefficient of determination)
+SSE <- sum((obs - pred)^2)
+SST <- sum((obs - mean(obs))^2)
+R2 <- 1 - SSE/SST
+print(R2)
+
+# 6. Relative RMSE (RMSE / mean observed)
+rRMSE <- RMSE / mean(obs) * 100
+
+# Save metrics
+NAIP_TreeDetection_ModResults <- data.frame(
+  RMSE = RMSE,
+  MAE = MAE,
+  Bias = Bias,
+  MAPE_percent = MAPE,
+  R2 = R2,
+  rRMSE_percent = rRMSE
+)
+
+# Now plot the results
+plot(obs, pred,
+     xlab = "Observed plot biomass",
+     ylab = "Predicted plot biomass",
+     main = "Observed vs Predicted Plot Biomass")
+
+abline(0, 1, col = "red", lwd = 2)
+
+# Print the R2 result 
+text(x = min(obs),
+     y = max(pred),
+     labels = paste("R2 =", round(R2, 3)),
+     pos = 4)
+
+
+```
+
+
+And the lidar-derived tree list
+
+```{r}
+# Create tree and plot df
+df_tree <- allTreeCrowns_Lidar_final
+df_plot <- plotLevelBiomass
+
+# Select tree variables
+df_tree <- df_tree[,c("plotID", "tree_height_m", "area_m2")]
+df_tree <- st_drop_geometry(df_tree)
+
+# Select plot variables
+df_plot <- df_plot[,c("plot_id", "total_biomass")]
+df_plot <- st_drop_geometry(df_plot)
+
+# Subset data to these variables
+colnames(df_tree) <- c("plot_id", "tree_height", "tree_area")
+colnames(df_plot) <- c("plot_id", "plot_biomass")
+
+# Merge the data
+df <- merge(df_plot, df_tree)
+
+# Split into list by plot
+plot_ids <- unique(df$plot_id)
+tree_list <- split(df, df$plot_id)
+
+# Extract the observed plot biomass
+plot_biomass <- tapply(df$plot_biomass, df$plot_id, FUN = function(x) x[1])
+
+# Define a predictive allometric model
+predict_plot_biomass <- function(params) {
+  a <- params[1]
+  b <- params[2]
+  c <- params[3]
+  # d <- params[4]
+  
+  pred <- numeric(length(tree_list))
+  names(pred) <- names(tree_list)
+  
+  for(i in seq_along(tree_list)) {
+    trees <- tree_list[[i]]
+    
+    # Equation 1: Power Law
+    tree_vals <- a * (trees$tree_height^b) * (trees$tree_area^c)
+    
+    # Equation 2: Additive 
+    # tree_vals <- a + b * trees$tree_height + c * trees$tree_area
+    
+    # Equation 3: Additive non-linear
+    # tree_vals <- a * (trees$tree_height^b) + c * (trees$tree_area^d)
+    
+    # Equation 4: Just tree height
+    # tree_vals <- a * (trees$tree_height^b)
+    
+    # Equation 5: Just crown area
+    # tree_vals <- a * (trees$tree_area^b)
+    
+    pred[i] <- sum(tree_vals, na.rm = TRUE)
+  }
+  
+  pred
+}
+
+# Define the objective function (sum of squared errors)
+objective <- function(params) {
+  pred <- predict_plot_biomass(params)
+  # ensure ordering matches
+  resid <- plot_biomass - pred[names(plot_biomass)]
+  sum(resid^2)
+}
+
+# Fit the model through numerical optimization
+start_vals <- c(a = 0.1, 
+                b = 1, 
+                c = 1
+)
+
+# Fit the parameters
+fit <- optim(
+  par = 
+    start_vals,
+  fn = objective,
+  
+  # Broyden, Fletcher, Goldfarb, and Shanno
+  # Uses function values and gradients to build up a picture of the surface to be optimized
+  method = "L-BFGS-B",
+  lower = c(1e-6, 
+            -5,
+            -5),
+  upper = c(100,  
+            5,
+            5))
+
+# Whats here?
+# The best set of parameters found
+# The coefficients for individual tree level biomass! 
+fit$par 
+
+# Return the predicted biomass
+predicted <- predict_plot_biomass(fit$par)
+print(predicted)
+
+# Create a dataframe of the predicted biomass
+predicted_df <- as.data.frame(predicted)
+predicted_df$PlotID <- rownames(predicted_df)
+rownames(predicted_df) <- NULL
+
+# Create a dataframe of the measured plot biomass
+observed_df <- as.data.frame(plot_biomass)
+observed_df$PlotID <- rownames(observed_df)
+rownames(observed_df) <- NULL
+
+# Join the two biomass estimates
+final_df <- left_join(predicted_df, observed_df, by = "PlotID")
+
+# scatterplot
+plot(plot_biomass, predicted,
+     xlab = "Observed plot biomass",
+     ylab = "Predicted plot biomass")
+abline(0, 1, col = "red")
+
+# Observed and predicted vectors
+obs <- plot_biomass
+pred <- predicted[names(plot_biomass)]   
+
+# 1. Root Mean Squared Error
+RMSE <- sqrt(mean((obs - pred)^2))
+print(RMSE)
+
+# 2. Mean Absolute Error
+MAE <- mean(abs(obs - pred))
+print(MAE)
+
+# 3. Bias (signed error)
+Bias <- mean(pred - obs)
+
+# 4. Mean Absolute Percent Error
+MAPE <- mean(abs((obs - pred) / obs)) * 100
+
+# 5. R-squared (coefficient of determination)
+SSE <- sum((obs - pred)^2)
+SST <- sum((obs - mean(obs))^2)
+R2 <- 1 - SSE/SST
+print(R2)
+
+# 6. Relative RMSE (RMSE / mean observed)
+rRMSE <- RMSE / mean(obs) * 100
+
+# Save metrics
+Lidar_TreeDetection_ModResults <- data.frame(
+  RMSE = RMSE,
+  MAE = MAE,
+  Bias = Bias,
+  MAPE_percent = MAPE,
+  R2 = R2,
+  rRMSE_percent = rRMSE
+)
+
+# Now plot the results
+plot(obs, pred,
+     xlab = "Observed plot biomass",
+     ylab = "Predicted plot biomass",
+     main = "Observed vs Predicted Plot Biomass")
+
+abline(0, 1, col = "red", lwd = 2)
+
+# Print the R2 result 
+text(x = min(obs),
+     y = max(pred),
+     labels = paste("R2 =", round(R2, 3)),
+     pos = 4)
+
+
+```
+
+## Optimize the parameters
+
+This script iteratively tests model performance on a multitude of different tree segmentation parameters. This can be performed on either the lidar or NAIP-derived tree lists. The parameters that yield the best performance can then be used to run tree detection across all plots.
+
+The user inputs can be tuned below. 
+```{r}
+# Select the data source to optimize
+source_name <- "NAIP"
+
+# Create a parameter grid to tune
+param_grid <- expand.grid(
+  th_tree_lidar = c(0.25, 0.5),
+  th_seed_lidar = c(0.35, 0.40),
+  th_cr_lidar   = c(0.55, 0.60),
+  max_cr_lidar  = c(15, 20),
+  stringsAsFactors = FALSE
+)
+
+# Starting values for biomass optimization
+# tree_biomass = a * tree_height^b * tree_area^c
+start_vals   <- c(a = 0.1, b = 1, c = 1)
+lower_bounds <- c(1e-6, -5, -5)
+upper_bounds <- c(100,   5,  5)
+
+# Optional subset for testing
+plots_to_run <- intersect(Lidar_PlotNames, plotLevelBiomass$plot_id)
+# plots_to_run <- as.character(c("UOFU_AZCV_P01", "UOFU_AZCV_P02"))
+
+
+# Select the observed plot biomass dataframe
+df_plot_obs <- plotLevelBiomass %>%
+  st_drop_geometry() %>%
+  dplyr::select(plot_id, total_biomass) %>%
+  rename(plot_biomass = total_biomass)
+
+```
+
+We'll now initialize the function that loops through the field plots and tests the tree detection parameters with the model. 
+```{r}
+# Define the function 
+run_lidar_iteration <- function(th_tree_lidar,
+                                th_seed_lidar,
+                                th_cr_lidar,
+                                max_cr_lidar,
+                                plots_to_run,
+                                allPlotCHMs_Lidar,
+                                h,
+                                fieldPlots_extents,
+                                df_plot_obs,
+                                start_vals,
+                                lower_bounds,
+                                upper_bounds,
+                                source_name = "Lidar") {
+  
+  # Store tree tops and crowns as a list
+  Lidar_treePoints_list <- list()
+  Lidar_treeCrowns_list <- list()
+  
+  # Loop through each plot CHM and run tree detection
+  for (plot_id in plots_to_run) {
+    
+    message("Processing plot: ", plot_id,
+            " | th_tree=", th_tree_lidar,
+            " th_seed=", th_seed_lidar,
+            " th_cr=", th_cr_lidar,
+            " max_cr=", max_cr_lidar)
+    
+    # Select a single plot CHM
+    chm <- allPlotCHMs_Lidar[[plot_id]]
+    
+    if (is.null(chm)) {
+      message("CHM is NULL for plot: ", plot_id)
+      next
+    }
+    
+    # Ensure proper projection
+    chm <- terra::project(chm, "EPSG:32612")
+    
+    # Identify Tree Tops
+    ttops <- tryCatch(
+      locate_trees(chm, lmf(ws = h, hmin = 0.5)),
+      error = function(e) {
+        message("Treetops failed: ", e$message)
+        NULL
+      }
+    )
+    
+    # Skip if no treetops
+    if (is.null(ttops) ||
+        (inherits(ttops, "data.frame") && nrow(ttops) == 0) ||
+        (inherits(ttops, "sf") && nrow(ttops) == 0) ||
+        (inherits(ttops, "SpatVector") && terra::nrow(ttops) == 0)) {
+      message("No treetops detected for plot: ", plot_id)
+      next
+    }
+    
+    # Convert to sf object
+    ttops_sf <- tryCatch(
+      st_as_sf(ttops),
+      error = function(e) {
+        message("st_as_sf failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(ttops_sf) || nrow(ttops_sf) == 0) {
+      message("No valid treetop sf object for plot: ", plot_id)
+      next
+    }
+    
+    # Run Dalponte2016 tree segmentation algorithm
+    crowns_id <- tryCatch(
+      dalponte2016(
+        chm      = chm,
+        treetops = ttops_sf,
+        th_tree  = th_tree_lidar,
+        th_seed  = th_seed_lidar,
+        th_cr    = th_cr_lidar,
+        max_cr   = max_cr_lidar
+      )(),
+      error = function(e) {
+        message("Dalponte CHM-only failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(crowns_id)) {
+      message("No crown raster returned for plot: ", plot_id)
+      next
+    }
+    
+    # Convert crown segmentation raster to polygons
+    crowns_poly <- tryCatch(
+      terra::as.polygons(crowns_id, dissolve = TRUE, na.rm = TRUE),
+      error = function(e) {
+        message("as.polygons failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(crowns_poly) || terra::nrow(crowns_poly) == 0) {
+      message("No crown polygons for plot: ", plot_id)
+      next
+    }
+    
+    # Store names as treeID
+    names(crowns_poly) <- "treeID"
+    
+    # Calculate Crown Area in m2
+    crowns_poly$area_m2 <- terra::expanse(crowns_poly, unit = "m")
+    
+    # Extract the maximum height for each crown polygon
+    zmax <- tryCatch(
+      terra::extract(chm, crowns_poly, fun = max, na.rm = TRUE),
+      error = function(e) {
+        message("extract failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(zmax) || nrow(zmax) != terra::nrow(crowns_poly)) {
+      message("Height extraction row mismatch for plot: ", plot_id,
+              " | crowns=", terra::nrow(crowns_poly),
+              " | zmax=", ifelse(is.null(zmax), 0, nrow(zmax)))
+      next
+    }
+    
+    # Assign the maximum height to the crown polygons
+    crowns_poly$tree_height_m <- zmax[,2]
+    
+    # Convert to sf 
+    crowns_sf <- sf::st_as_sf(crowns_poly)
+    
+    # Add plot ID
+    crowns_sf$plotID <- plot_id
+    ttops_sf$plotID <- plot_id
+    
+    # Store
+    Lidar_treePoints_list[[plot_id]] <- ttops_sf
+    Lidar_treeCrowns_list[[plot_id]] <- crowns_sf
+  }
+  
+  # Bind all rows
+  allTreePoints_Lidar <- dplyr::bind_rows(Lidar_treePoints_list)
+  allTreeCrowns_Lidar <- dplyr::bind_rows(Lidar_treeCrowns_list)
+  
+  # If nothing was detected, return empty iteration
+  if (nrow(allTreeCrowns_Lidar) == 0 || nrow(allTreePoints_Lidar) == 0) {
+    return(list(
+      iteration_summary = data.frame(
+        source = source_name,
+        th_tree_lidar = th_tree_lidar,
+        th_seed_lidar = th_seed_lidar,
+        th_cr_lidar = th_cr_lidar,
+        max_cr_lidar = max_cr_lidar,
+        a = NA_real_,
+        b = NA_real_,
+        c = NA_real_,
+        converged = FALSE,
+        objective_value = NA_real_,
+        n_plots_modeled = 0,
+        n_detected_trees_total = 0,
+        RMSE = NA_real_,
+        MAE = NA_real_,
+        Bias = NA_real_,
+        MAPE_percent = NA_real_,
+        R2 = NA_real_,
+        rRMSE_percent = NA_real_,
+        stringsAsFactors = FALSE
+      ),
+      plot_metrics = data.frame(),
+      modeled_trees = data.frame()
+    ))
+  }
+  
+  # Check projection
+  allTreePoints_Lidar <- st_transform(allTreePoints_Lidar, st_crs(fieldPlots_extents))
+  allTreeCrowns_Lidar <- st_transform(allTreeCrowns_Lidar, st_crs(fieldPlots_extents))
+  
+  # Keep only the tree points that fall within the field plot extents
+  ttops_in_plots <- allTreePoints_Lidar[
+    lengths(st_within(allTreePoints_Lidar, fieldPlots_extents)) > 0,
+  ]
+  
+  # Filter only the tree crowns which have an associated tree top that falls within the field plot extents
+  keys <- ttops_in_plots %>%
+    st_drop_geometry() %>%
+    distinct(plotID, treeID)
+  
+  # Subset to only the crowns we want to keep
+  allTreeCrowns_Lidar_final <- allTreeCrowns_Lidar %>%
+    inner_join(keys, by = c("plotID", "treeID"))
+  
+  # If still empty after filtering, return empty iteration
+  if (nrow(allTreeCrowns_Lidar_final) == 0) {
+    return(list(
+      iteration_summary = data.frame(
+        source = source_name,
+        th_tree_lidar = th_tree_lidar,
+        th_seed_lidar = th_seed_lidar,
+        th_cr_lidar = th_cr_lidar,
+        max_cr_lidar = max_cr_lidar,
+        a = NA_real_,
+        b = NA_real_,
+        c = NA_real_,
+        converged = FALSE,
+        objective_value = NA_real_,
+        n_plots_modeled = 0,
+        n_detected_trees_total = 0,
+        RMSE = NA_real_,
+        MAE = NA_real_,
+        Bias = NA_real_,
+        MAPE_percent = NA_real_,
+        R2 = NA_real_,
+        rRMSE_percent = NA_real_,
+        stringsAsFactors = FALSE
+      ),
+      plot_metrics = data.frame(),
+      modeled_trees = data.frame()
+    ))
+  }
+  
+
+  ## Optimize coefficients for individual tree level biomass estimation
+  # Create tree and plot df
+  df_tree <- allTreeCrowns_Lidar_final
+  df_plot <- df_plot_obs
+  
+  # Select tree variables
+  df_tree <- df_tree[, c("plotID", "tree_height_m", "area_m2")]
+  df_tree <- st_drop_geometry(df_tree)
+  
+  # Rename columns to match your biomass script
+  colnames(df_tree) <- c("plot_id", "tree_height", "tree_area")
+  
+  # Merge the data
+  df <- merge(df_plot, df_tree, by = "plot_id")
+  
+  # If merge fails, return empty metrics for this iteration
+  if (nrow(df) == 0) {
+    return(list(
+      iteration_summary = data.frame(
+        source = source_name,
+        th_tree_lidar = th_tree_lidar,
+        th_seed_lidar = th_seed_lidar,
+        th_cr_lidar = th_cr_lidar,
+        max_cr_lidar = max_cr_lidar,
+        a = NA_real_,
+        b = NA_real_,
+        c = NA_real_,
+        converged = FALSE,
+        objective_value = NA_real_,
+        n_plots_modeled = 0,
+        n_detected_trees_total = nrow(df_tree),
+        RMSE = NA_real_,
+        MAE = NA_real_,
+        Bias = NA_real_,
+        MAPE_percent = NA_real_,
+        R2 = NA_real_,
+        rRMSE_percent = NA_real_,
+        stringsAsFactors = FALSE
+      ),
+      plot_metrics = data.frame(),
+      modeled_trees = df_tree
+    ))
+  }
+  
+  # Split into list by plot
+  tree_list <- split(df, df$plot_id)
+  
+  # Extract the observed plot biomass
+  plot_biomass <- tapply(df$plot_biomass, df$plot_id, FUN = function(x) x[1])
+  
+  # Predictive allometric model
+  predict_plot_biomass <- function(params) {
+    a <- params[1]
+    b <- params[2]
+    c <- params[3]
+    
+    pred <- numeric(length(tree_list))
+    names(pred) <- names(tree_list)
+    
+    for (i in seq_along(tree_list)) {
+      trees <- tree_list[[i]]
+      tree_vals <- a * (trees$tree_height^b) * (trees$tree_area^c)
+      pred[i] <- sum(tree_vals, na.rm = TRUE)
+    }
+    
+    pred
+  }
+  
+  # Objective function: minimize SSE at the plot level
+  objective_function <- function(params) {
+    pred <- predict_plot_biomass(params)
+    obs  <- plot_biomass[names(pred)]
+    sum((obs - pred)^2, na.rm = TRUE)
+  }
+  
+  # Optimize
+  fit <- tryCatch(
+    optim(
+      par = start_vals,
+      fn = objective_function,
+      method = "L-BFGS-B",
+      lower = lower_bounds,
+      upper = upper_bounds
+    ),
+    error = function(e) {
+      message("Optimization failed: ", e$message)
+      NULL
+    }
+  )
+  
+  if (is.null(fit)) {
+    return(list(
+      iteration_summary = data.frame(
+        source = source_name,
+        th_tree_lidar = th_tree_lidar,
+        th_seed_lidar = th_seed_lidar,
+        th_cr_lidar = th_cr_lidar,
+        max_cr_lidar = max_cr_lidar,
+        a = NA_real_,
+        b = NA_real_,
+        c = NA_real_,
+        converged = FALSE,
+        objective_value = NA_real_,
+        n_plots_modeled = length(plot_biomass),
+        n_detected_trees_total = nrow(df_tree),
+        RMSE = NA_real_,
+        MAE = NA_real_,
+        Bias = NA_real_,
+        MAPE_percent = NA_real_,
+        R2 = NA_real_,
+        rRMSE_percent = NA_real_,
+        stringsAsFactors = FALSE
+      ),
+      plot_metrics = data.frame(),
+      modeled_trees = df_tree
+    ))
+  }
+  
+  # Predictions
+  pred <- predict_plot_biomass(fit$par)
+  obs  <- plot_biomass[names(pred)]
+  
+  # Metrics
+  RMSE <- sqrt(mean((obs - pred)^2, na.rm = TRUE))
+  MAE  <- mean(abs(obs - pred), na.rm = TRUE)
+  Bias <- mean(pred - obs, na.rm = TRUE)
+  MAPE <- mean(abs((obs - pred) / ifelse(obs == 0, NA, obs)), na.rm = TRUE) * 100
+  SSE  <- sum((obs - pred)^2, na.rm = TRUE)
+  SST  <- sum((obs - mean(obs, na.rm = TRUE))^2, na.rm = TRUE)
+  R2   <- ifelse(SST == 0, NA_real_, 1 - SSE / SST)
+  rRMSE <- RMSE / mean(obs, na.rm = TRUE) * 100
+  
+  # Plot-level results
+  plot_metrics <- data.frame(
+    plot_id = names(pred),
+    observed_plot_biomass = as.numeric(obs),
+    predicted_plot_biomass = as.numeric(pred),
+    residual = as.numeric(pred - obs),
+    stringsAsFactors = FALSE
+  )
+  
+  # Tree-level table used in this iteration
+  modeled_trees <- df_tree %>%
+    mutate(
+      iteration_source = source_name,
+      th_tree_lidar = th_tree_lidar,
+      th_seed_lidar = th_seed_lidar,
+      th_cr_lidar = th_cr_lidar,
+      max_cr_lidar = max_cr_lidar,
+      a = fit$par[1],
+      b = fit$par[2],
+      c = fit$par[3]
+    )
+  
+  # Iteration summary
+  iteration_summary <- data.frame(
+    source = source_name,
+    th_tree_lidar = th_tree_lidar,
+    th_seed_lidar = th_seed_lidar,
+    th_cr_lidar = th_cr_lidar,
+    max_cr_lidar = max_cr_lidar,
+    a = fit$par[1],
+    b = fit$par[2],
+    c = fit$par[3],
+    converged = fit$convergence == 0,
+    objective_value = fit$value,
+    n_plots_modeled = length(obs),
+    n_detected_trees_total = nrow(df_tree),
+    RMSE = RMSE,
+    MAE = MAE,
+    Bias = Bias,
+    MAPE_percent = MAPE,
+    R2 = R2,
+    rRMSE_percent = rRMSE,
+    stringsAsFactors = FALSE
+  )
+  
+  list(
+    iteration_summary = iteration_summary,
+    plot_metrics = plot_metrics,
+    modeled_trees = modeled_trees
+  )
+}
+```
+
+Run 
+```{r}
+
+n_iters <- nrow(param_grid)
+iteration_results_lidar <- vector("list", n_iters)
+
+# Start total timer
+total_start_time <- Sys.time()
+
+# Progress bar
+pb <- txtProgressBar(min = 0, max = n_iters, style = 3)
+
+for (i in seq_len(n_iters)) {
+  
+  iter_start_time <- Sys.time()
+  pars <- param_grid[i, ]
+  
+  message(
+    "\nStarting iteration ", i, " of ", n_iters,
+    " | th_tree=", pars$th_tree_lidar,
+    " th_seed=", pars$th_seed_lidar,
+    " th_cr=", pars$th_cr_lidar,
+    " max_cr=", pars$max_cr_lidar
+  )
+  
+  iteration_results_lidar[[i]] <- run_lidar_iteration(
+    th_tree_lidar = pars$th_tree_lidar,
+    th_seed_lidar = pars$th_seed_lidar,
+    th_cr_lidar   = pars$th_cr_lidar,
+    max_cr_lidar  = pars$max_cr_lidar,
+    plots_to_run = plots_to_run,
+    allPlotCHMs_Lidar = allPlotCHMs_Lidar,
+    h = h,
+    fieldPlots_extents = fieldPlots_extents,
+    df_plot_obs = df_plot_obs,
+    start_vals = start_vals,
+    lower_bounds = lower_bounds,
+    upper_bounds = upper_bounds,
+    source_name = source_name
+  )
+  
+  # End iteration timer
+  iter_end_time <- Sys.time()
+  iter_time_sec <- as.numeric(difftime(iter_end_time, iter_start_time, units = "secs"))
+  
+  # Update progress bar
+  setTxtProgressBar(pb, i)
+  
+  # Estimate remaining time
+  elapsed_total_sec <- as.numeric(difftime(iter_end_time, total_start_time, units = "secs"))
+  avg_time_per_iter <- elapsed_total_sec / i
+  remaining_iters <- n_iters - i
+  est_remaining_sec <- avg_time_per_iter * remaining_iters
+  
+  message(
+    "Finished iteration ", i, "/", n_iters,
+    " in ", round(iter_time_sec, 2), " sec",
+    " | elapsed: ", round(elapsed_total_sec / 60, 2), " min",
+    " | est. remaining: ", round(est_remaining_sec / 60, 2), " min"
+  )
+}
+
+close(pb)
+
+# End total timer
+total_end_time <- Sys.time()
+total_time_min <- as.numeric(difftime(total_end_time, total_start_time, units = "mins"))
+
+message("\nAll iterations completed in ", round(total_time_min, 2), " minutes.")
+
+```
+
+
+Get the results
+```{r}
+
+optimization_results_lidar <- tibble(
+  iteration = seq_along(iteration_results_lidar),
+  summary = lapply(iteration_results_lidar, `[[`, "iteration_summary"),
+  plot_metrics = lapply(iteration_results_lidar, `[[`, "plot_metrics"),
+  modeled_trees = lapply(iteration_results_lidar, `[[`, "modeled_trees")
+) %>%
+  mutate(summary = purrr::map(summary, as.data.frame)) %>%
+  tidyr::unnest(summary) %>%
+  arrange(RMSE, desc(R2))
+
+optimization_plot_metrics_lidar <- bind_rows(
+  lapply(seq_along(iteration_results_lidar), function(i) {
+    x <- iteration_results_lidar[[i]]$plot_metrics
+    if (nrow(x) == 0) return(NULL)
+    
+    pars <- param_grid[i, ]
+    summ <- iteration_results_lidar[[i]]$iteration_summary
+    
+    x %>%
+      mutate(
+        iteration = i,
+        source = source_name,
+        th_tree_lidar = pars$th_tree_lidar,
+        th_seed_lidar = pars$th_seed_lidar,
+        th_cr_lidar   = pars$th_cr_lidar,
+        max_cr_lidar  = pars$max_cr_lidar,
+        a = summ$a,
+        b = summ$b,
+        c = summ$c
+      )
+  })
+)
+
+optimization_tree_table_lidar <- bind_rows(
+  lapply(seq_along(iteration_results_lidar), function(i) {
+    x <- iteration_results_lidar[[i]]$modeled_trees
+    if (nrow(x) == 0) return(NULL)
+    x %>% mutate(iteration = i)
+  })
+)
+
+# Ranked results
+optimization_results_lidar
+
+# Best run
+best_iteration_lidar <- optimization_results_lidar %>% slice(1)
+best_iteration_lidar
+
+```
+
+```{r}
+# Choose source and corresponding CHM list
+source_name <- "NAIP"
+# source_name <- "Lidar"
+
+if (source_name == "Lidar") {
+  chm_list <- allPlotCHMs_Lidar
+  plots_to_run <- intersect(Lidar_PlotNames, plotLevelBiomass$plot_id)
+}
+
+if (source_name == "NAIP") {
+  chm_list <- allPlotsCHMs_NAIP
+  plots_to_run <- intersect(names(allPlotsCHMs_NAIP), plotLevelBiomass$plot_id)
+}
+
+# plots_to_run <- c("UOFU_AZCV_P01", "UOFU_AZCV_P02")
+
+# Parameter grid
+param_grid <- expand.grid(
+  th_tree = c(0.50),
+  th_seed = c(0.3, 0.35, 0.40, 0.45, 0.5, 0.55, 0.6),
+  th_cr   = c(0.3, 0.35, 0.4, 0.45, 0.55, 0.55, 0.60),
+  max_cr  = c(15, 20, 25),
+  stringsAsFactors = FALSE
+)
+
+# Starting values for biomass model
+# tree_biomass = a * tree_height^b * tree_area^c
+start_vals   <- c(a = 0.1, b = 1, c = 1)
+lower_bounds <- c(1e-6, -5, -5)
+upper_bounds <- c(100, 5, 5)
+
+# Observed plot biomass
+df_plot_obs <- plotLevelBiomass %>%
+  st_drop_geometry() %>%
+  dplyr::select(plot_id, total_biomass) %>%
+  rename(plot_biomass = total_biomass)
+
+# ============================================================
+# 2. MAIN ITERATION FUNCTION
+# ============================================================
+
+run_segmentation_iteration <- function(th_tree,
+                                       th_seed,
+                                       th_cr,
+                                       max_cr,
+                                       plots_to_run,
+                                       chm_list,
+                                       h,
+                                       fieldPlots_extents,
+                                       df_plot_obs,
+                                       start_vals,
+                                       lower_bounds,
+                                       upper_bounds,
+                                       source_name = "Lidar") {
+  
+  tree_points_list <- list()
+  tree_crowns_list <- list()
+  
+  for (plot_id in plots_to_run) {
+    
+    message(
+      "Processing plot: ", plot_id,
+      " | th_tree=", th_tree,
+      " th_seed=", th_seed,
+      " th_cr=", th_cr,
+      " max_cr=", max_cr
+    )
+    
+    chm <- chm_list[[plot_id]]
+    
+    if (is.null(chm)) {
+      message("CHM is NULL for plot: ", plot_id)
+      next
+    }
+    
+    chm <- terra::project(chm, "EPSG:32612")
+    
+    ttops <- tryCatch(
+      locate_trees(chm, lmf(ws = h, hmin = 0.5)),
+      error = function(e) {
+        message("Treetops failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(ttops) ||
+        (inherits(ttops, "data.frame") && nrow(ttops) == 0) ||
+        (inherits(ttops, "sf") && nrow(ttops) == 0) ||
+        (inherits(ttops, "SpatVector") && terra::nrow(ttops) == 0)) {
+      message("No treetops detected for plot: ", plot_id)
+      next
+    }
+    
+    ttops_sf <- tryCatch(
+      st_as_sf(ttops),
+      error = function(e) {
+        message("st_as_sf failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(ttops_sf) || nrow(ttops_sf) == 0) {
+      message("No valid treetop sf object for plot: ", plot_id)
+      next
+    }
+    
+    crowns_id <- tryCatch(
+      dalponte2016(
+        chm      = chm,
+        treetops = ttops_sf,
+        th_tree  = th_tree,
+        th_seed  = th_seed,
+        th_cr    = th_cr,
+        max_cr   = max_cr
+      )(),
+      error = function(e) {
+        message("Dalponte failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(crowns_id)) {
+      message("No crown raster returned for plot: ", plot_id)
+      next
+    }
+    
+    crowns_poly <- tryCatch(
+      terra::as.polygons(crowns_id, dissolve = TRUE, na.rm = TRUE),
+      error = function(e) {
+        message("as.polygons failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(crowns_poly) || terra::nrow(crowns_poly) == 0) {
+      message("No crown polygons for plot: ", plot_id)
+      next
+    }
+    
+    names(crowns_poly) <- "treeID"
+    crowns_poly$area_m2 <- terra::expanse(crowns_poly, unit = "m")
+    
+    zmax <- tryCatch(
+      terra::extract(chm, crowns_poly, fun = max, na.rm = TRUE),
+      error = function(e) {
+        message("Height extraction failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(zmax) || nrow(zmax) != terra::nrow(crowns_poly)) {
+      message(
+        "Height extraction row mismatch for plot: ", plot_id,
+        " | crowns=", terra::nrow(crowns_poly),
+        " | zmax=", ifelse(is.null(zmax), 0, nrow(zmax))
+      )
+      next
+    }
+    
+    crowns_poly$tree_height_m <- zmax[, 2]
+    
+    crowns_sf <- st_as_sf(crowns_poly)
+    crowns_sf$plotID <- plot_id
+    ttops_sf$plotID <- plot_id
+    
+    tree_points_list[[plot_id]] <- ttops_sf
+    tree_crowns_list[[plot_id]] <- crowns_sf
+  }
+  
+  all_tree_points <- bind_rows(tree_points_list)
+  all_tree_crowns <- bind_rows(tree_crowns_list)
+  
+  if (nrow(all_tree_points) == 0 || nrow(all_tree_crowns) == 0) {
+    return(list(
+      iteration_summary = data.frame(
+        source = source_name,
+        th_tree = th_tree,
+        th_seed = th_seed,
+        th_cr = th_cr,
+        max_cr = max_cr,
+        a = NA_real_,
+        b = NA_real_,
+        c = NA_real_,
+        converged = FALSE,
+        objective_value = NA_real_,
+        n_plots_modeled = 0,
+        n_detected_trees_total = 0,
+        RMSE = NA_real_,
+        MAE = NA_real_,
+        Bias = NA_real_,
+        MAPE_percent = NA_real_,
+        R2 = NA_real_,
+        rRMSE_percent = NA_real_,
+        stringsAsFactors = FALSE
+      ),
+      plot_metrics = data.frame(),
+      modeled_trees = data.frame()
+    ))
+  }
+  
+  all_tree_points <- st_transform(all_tree_points, st_crs(fieldPlots_extents))
+  all_tree_crowns <- st_transform(all_tree_crowns, st_crs(fieldPlots_extents))
+  
+  ttops_in_plots <- all_tree_points[
+    lengths(st_within(all_tree_points, fieldPlots_extents)) > 0,
+  ]
+  
+  keys <- ttops_in_plots %>%
+    st_drop_geometry() %>%
+    distinct(plotID, treeID)
+  
+  all_tree_crowns_final <- all_tree_crowns %>%
+    inner_join(keys, by = c("plotID", "treeID"))
+  
+  if (nrow(all_tree_crowns_final) == 0) {
+    return(list(
+      iteration_summary = data.frame(
+        source = source_name,
+        th_tree = th_tree,
+        th_seed = th_seed,
+        th_cr = th_cr,
+        max_cr = max_cr,
+        a = NA_real_,
+        b = NA_real_,
+        c = NA_real_,
+        converged = FALSE,
+        objective_value = NA_real_,
+        n_plots_modeled = 0,
+        n_detected_trees_total = 0,
+        RMSE = NA_real_,
+        MAE = NA_real_,
+        Bias = NA_real_,
+        MAPE_percent = NA_real_,
+        R2 = NA_real_,
+        rRMSE_percent = NA_real_,
+        stringsAsFactors = FALSE
+      ),
+      plot_metrics = data.frame(),
+      modeled_trees = data.frame()
+    ))
+  }
+  
+  # Prepare tree-level dataframe
+  df_tree <- all_tree_crowns_final %>%
+    st_drop_geometry() %>%
+    dplyr::select(plotID, tree_height_m, area_m2) %>%
+    rename(
+      plot_id = plotID,
+      tree_height = tree_height_m,
+      tree_area = area_m2
+    )
+  
+  df <- merge(df_plot_obs, df_tree, by = "plot_id")
+  
+  if (nrow(df) == 0) {
+    return(list(
+      iteration_summary = data.frame(
+        source = source_name,
+        th_tree = th_tree,
+        th_seed = th_seed,
+        th_cr = th_cr,
+        max_cr = max_cr,
+        a = NA_real_,
+        b = NA_real_,
+        c = NA_real_,
+        converged = FALSE,
+        objective_value = NA_real_,
+        n_plots_modeled = 0,
+        n_detected_trees_total = nrow(df_tree),
+        RMSE = NA_real_,
+        MAE = NA_real_,
+        Bias = NA_real_,
+        MAPE_percent = NA_real_,
+        R2 = NA_real_,
+        rRMSE_percent = NA_real_,
+        stringsAsFactors = FALSE
+      ),
+      plot_metrics = data.frame(),
+      modeled_trees = df_tree
+    ))
+  }
+  
+  tree_list <- split(df, df$plot_id)
+  plot_biomass <- tapply(df$plot_biomass, df$plot_id, function(x) x[1])
+  
+  predict_plot_biomass <- function(params) {
+    a <- params[1]
+    b <- params[2]
+    c <- params[3]
+    
+    pred <- numeric(length(tree_list))
+    names(pred) <- names(tree_list)
+    
+    for (i in seq_along(tree_list)) {
+      trees <- tree_list[[i]]
+      tree_vals <- a * (trees$tree_height ^ b) * (trees$tree_area ^ c)
+      pred[i] <- sum(tree_vals, na.rm = TRUE)
+    }
+    
+    pred
+  }
+  
+  objective_function <- function(params) {
+    pred <- predict_plot_biomass(params)
+    obs <- plot_biomass[names(pred)]
+    sum((obs - pred)^2, na.rm = TRUE)
+  }
+  
+  fit <- tryCatch(
+    optim(
+      par = start_vals,
+      fn = objective_function,
+      method = "L-BFGS-B",
+      lower = lower_bounds,
+      upper = upper_bounds
+    ),
+    error = function(e) {
+      message("Optimization failed: ", e$message)
+      NULL
+    }
+  )
+  
+  if (is.null(fit)) {
+    return(list(
+      iteration_summary = data.frame(
+        source = source_name,
+        th_tree = th_tree,
+        th_seed = th_seed,
+        th_cr = th_cr,
+        max_cr = max_cr,
+        a = NA_real_,
+        b = NA_real_,
+        c = NA_real_,
+        converged = FALSE,
+        objective_value = NA_real_,
+        n_plots_modeled = length(plot_biomass),
+        n_detected_trees_total = nrow(df_tree),
+        RMSE = NA_real_,
+        MAE = NA_real_,
+        Bias = NA_real_,
+        MAPE_percent = NA_real_,
+        R2 = NA_real_,
+        rRMSE_percent = NA_real_,
+        stringsAsFactors = FALSE
+      ),
+      plot_metrics = data.frame(),
+      modeled_trees = df_tree
+    ))
+  }
+  
+  pred <- predict_plot_biomass(fit$par)
+  obs <- plot_biomass[names(pred)]
+  
+  RMSE <- sqrt(mean((obs - pred)^2, na.rm = TRUE))
+  MAE <- mean(abs(obs - pred), na.rm = TRUE)
+  Bias <- mean(pred - obs, na.rm = TRUE)
+  MAPE <- mean(abs((obs - pred) / ifelse(obs == 0, NA, obs)), na.rm = TRUE) * 100
+  SSE <- sum((obs - pred)^2, na.rm = TRUE)
+  SST <- sum((obs - mean(obs, na.rm = TRUE))^2, na.rm = TRUE)
+  R2 <- ifelse(SST == 0, NA_real_, 1 - SSE / SST)
+  rRMSE <- RMSE / mean(obs, na.rm = TRUE) * 100
+  
+  plot_metrics <- data.frame(
+    plot_id = names(pred),
+    observed_plot_biomass = as.numeric(obs),
+    predicted_plot_biomass = as.numeric(pred),
+    residual = as.numeric(pred - obs),
+    stringsAsFactors = FALSE
+  )
+  
+  modeled_trees <- df_tree %>%
+    mutate(
+      source = source_name,
+      th_tree = th_tree,
+      th_seed = th_seed,
+      th_cr = th_cr,
+      max_cr = max_cr,
+      a = fit$par[1],
+      b = fit$par[2],
+      c = fit$par[3]
+    )
+  
+  iteration_summary <- data.frame(
+    source = source_name,
+    th_tree = th_tree,
+    th_seed = th_seed,
+    th_cr = th_cr,
+    max_cr = max_cr,
+    a = fit$par[1],
+    b = fit$par[2],
+    c = fit$par[3],
+    converged = fit$convergence == 0,
+    objective_value = fit$value,
+    n_plots_modeled = length(obs),
+    n_detected_trees_total = nrow(df_tree),
+    RMSE = RMSE,
+    MAE = MAE,
+    Bias = Bias,
+    MAPE_percent = MAPE,
+    R2 = R2,
+    rRMSE_percent = rRMSE,
+    stringsAsFactors = FALSE
+  )
+  
+  list(
+    iteration_summary = iteration_summary,
+    plot_metrics = plot_metrics,
+    modeled_trees = modeled_trees
+  )
+}
+
+# ============================================================
+# 3. RUN ALL ITERATIONS WITH TIMING + PROGRESS
+# ============================================================
+
+n_iters <- nrow(param_grid)
+iteration_results <- vector("list", n_iters)
+
+total_start_time <- Sys.time()
+pb <- txtProgressBar(min = 0, max = n_iters, style = 3)
+
+for (i in seq_len(n_iters)) {
+  
+  iter_start_time <- Sys.time()
+  pars <- param_grid[i, ]
+  
+  message(
+    "\nStarting iteration ", i, " of ", n_iters,
+    " | th_tree=", pars$th_tree,
+    " th_seed=", pars$th_seed,
+    " th_cr=", pars$th_cr,
+    " max_cr=", pars$max_cr
+  )
+  
+  iteration_results[[i]] <- run_segmentation_iteration(
+    th_tree = pars$th_tree,
+    th_seed = pars$th_seed,
+    th_cr = pars$th_cr,
+    max_cr = pars$max_cr,
+    plots_to_run = plots_to_run,
+    chm_list = chm_list,
+    h = h,
+    fieldPlots_extents = fieldPlots_extents,
+    df_plot_obs = df_plot_obs,
+    start_vals = start_vals,
+    lower_bounds = lower_bounds,
+    upper_bounds = upper_bounds,
+    source_name = source_name
+  )
+  
+  iter_end_time <- Sys.time()
+  iter_time_sec <- as.numeric(difftime(iter_end_time, iter_start_time, units = "secs"))
+  iteration_results[[i]]$iteration_summary$runtime_sec <- iter_time_sec
+  
+  setTxtProgressBar(pb, i)
+  
+  elapsed_total_sec <- as.numeric(difftime(iter_end_time, total_start_time, units = "secs"))
+  avg_time_per_iter <- elapsed_total_sec / i
+  remaining_iters <- n_iters - i
+  est_remaining_sec <- avg_time_per_iter * remaining_iters
+  
+  message(
+    "Finished iteration ", i, "/", n_iters,
+    " in ", round(iter_time_sec, 2), " sec",
+    " | elapsed: ", round(elapsed_total_sec / 60, 2), " min",
+    " | est. remaining: ", round(est_remaining_sec / 60, 2), " min"
+  )
+}
+
+close(pb)
+
+total_end_time <- Sys.time()
+total_time_min <- as.numeric(difftime(total_end_time, total_start_time, units = "mins"))
+
+message("\nAll iterations completed in ", round(total_time_min, 2), " minutes.")
+
+# ============================================================
+# 4. COLLECT RESULTS
+# ============================================================
+
+optimization_results <- tibble(
+  iteration = seq_along(iteration_results),
+  summary = lapply(iteration_results, `[[`, "iteration_summary"),
+  plot_metrics = lapply(iteration_results, `[[`, "plot_metrics"),
+  modeled_trees = lapply(iteration_results, `[[`, "modeled_trees")
+) %>%
+  mutate(summary = purrr::map(summary, as.data.frame)) %>%
+  tidyr::unnest(summary) %>%
+  arrange(RMSE, desc(R2))
+
+optimization_plot_metrics <- bind_rows(
+  lapply(seq_along(iteration_results), function(i) {
+    x <- iteration_results[[i]]$plot_metrics
+    if (nrow(x) == 0) return(NULL)
+    
+    pars <- param_grid[i, ]
+    summ <- iteration_results[[i]]$iteration_summary
+    
+    x %>%
+      mutate(
+        iteration = i,
+        source = source_name,
+        th_tree = pars$th_tree,
+        th_seed = pars$th_seed,
+        th_cr = pars$th_cr,
+        max_cr = pars$max_cr,
+        a = summ$a,
+        b = summ$b,
+        c = summ$c,
+        runtime_sec = summ$runtime_sec
+      )
+  })
+)
+
+optimization_tree_table <- bind_rows(
+  lapply(seq_along(iteration_results), function(i) {
+    x <- iteration_results[[i]]$modeled_trees
+    if (nrow(x) == 0) return(NULL)
+    x %>% mutate(iteration = i)
+  })
+)
+
+optimization_results
+best_iteration <- optimization_results %>% slice(1)
+best_iteration
+
+
+```
