@@ -47,7 +47,8 @@ pckgs <- c("sf",
            "purrr",
            "stringr",
            "tidyr",
-           "readr")
+           "readr",
+           "leaflet")
 
 # Point to packages
 newPckgs <- pckgs[!(pckgs %in% installed.packages()[,"Package"])]
@@ -70,6 +71,8 @@ library(purrr)
 library(stringr)
 library(tidyr)
 library(readr)
+library(leaflet)
+ 
 
 ```
 
@@ -651,22 +654,22 @@ crowns_poly_original <- crowns_poly
 crowns_poly$area_m2 <- terra::expanse(crowns_poly, unit = "m")
 
 
-# Set small crown threshold
-small_thresh <- 3 * res(chm_test)[1]^2   # Returns 1.07 m2
-small_thresh <- 4 * res(chm_test)[1]^2
-
-# Coerce the crowns into small/large classes
-small_crowns <- crowns_poly[crowns_poly$area_m2 <= small_thresh, ]
-big_crowns   <- crowns_poly[crowns_poly$area_m2 > small_thresh, ]
-
-# Only perform segmentation on large crowns
-big_crowns <- buffer(big_crowns, -1 * res(chm_test)[1]) |>
-  buffer(1 * res(chm_test)[1]) |>
-  simplifyGeom(res(chm_test)[1] / 4)
-
-
-crowns_poly <- rbind(big_crowns, small_crowns)
-crowns_poly <- crowns_poly[!terra::is.empty(crowns_poly), ]
+# # Set small crown threshold
+# small_thresh <- 3 * res(chm_test)[1]^2   # Returns 1.07 m2
+# small_thresh <- 4 * res(chm_test)[1]^2
+# 
+# # Coerce the crowns into small/large classes
+# small_crowns <- crowns_poly[crowns_poly$area_m2 <= small_thresh, ]
+# big_crowns   <- crowns_poly[crowns_poly$area_m2 > small_thresh, ]
+# 
+# # Only perform segmentation on large crowns
+# big_crowns <- buffer(big_crowns, -1 * res(chm_test)[1]) |>
+#   buffer(1 * res(chm_test)[1]) |>
+#   simplifyGeom(res(chm_test)[1] / 4)
+# 
+# 
+# crowns_poly <- rbind(big_crowns, small_crowns)
+# crowns_poly <- crowns_poly[!terra::is.empty(crowns_poly), ]
 
 # Drop empty / invalid geometries
 crowns_poly <- crowns_poly[!terra::is.empty(crowns_poly), ]
@@ -708,6 +711,11 @@ keys <- ttops_in_plots %>%
 ttops_sf <- ttops_sf %>%
   inner_join(keys, by = c("plotID", "treeID"))
 
+crowns_sf <- crowns_sf |>
+  semi_join(keys, by = c("plotID", "treeID"))
+
+ttops_sf <- st_transform(ttops_sf, st_crs("EPSG:32612"))
+
 ## ---------------- OPTIONAL METRICS ----------------
 
 crowns_vect <- terra::vect(crowns_sf)
@@ -716,42 +724,17 @@ crowns_sf$area_m2 <- terra::expanse(crowns_vect, unit = "m")
 zmax <- terra::extract(chm_test, crowns_vect, fun = max, na.rm = TRUE)
 crowns_sf$tree_height_m <- zmax[, 2]
 
-## ---------------- FILTER TO PLOT USING TREETOPS ----------------
-
-ttops_sf$plotID  <- chm_name
-crowns_sf$plotID <- chm_name
-
-# Keep only treetops inside the chosen plot
-ttops_in_plot <- ttops_sf[
-  lengths(st_within(ttops_sf, plot_extent)) > 0,
-]
-
-if (nrow(ttops_in_plot) == 0) {
-  stop("No treetops fall inside the selected plot boundary: ", chm_name)
-}
-
-keys <- ttops_in_plot |>
-  st_drop_geometry() |>
-  distinct(plotID, treeID)
-
-ttops_sf <- ttops_sf |>
-  semi_join(keys, by = c("plotID", "treeID"))
-
-crowns_sf <- crowns_sf |>
-  semi_join(keys, by = c("plotID", "treeID"))
-
-if (nrow(crowns_sf) == 0) {
-  stop("No crowns remained after filtering to plot boundary.")
-}
 
 ## ---------------- MAPVIEW PREP ----------------
 
 # Avoid FlatGeobuf errors
 mapviewOptions(fgb = FALSE)
 
-ttops_sf    <- drop_zm_safe(ttops_sf)
-crowns_sf   <- drop_zm_safe(crowns_sf)
-plot_extent <- drop_zm_safe(plot_extent)
+  crowns_sf <- st_as_sf(crowns_sf)
+  crowns_sf <- st_zm(crowns_sf, drop = TRUE, what = "ZM")
+  
+  ttops_sf <- st_as_sf(ttops_sf)
+  ttops_sf <- st_zm(ttops_sf, drop = TRUE, what = "ZM")
 
 ## ---------------- MAPVIEW ----------------
 
@@ -763,7 +746,7 @@ m <-
     legend = FALSE
   ) +
   mapview(
-    plot_extent,
+    fieldPlots_extents,
     color = "blue",
     alpha.regions = 0,
     lwd = 3,
@@ -1307,7 +1290,7 @@ th_cr_lidar   <- 0.6
 max_cr_lidar  <- 15
 
 # Plot to run
-chm_name <- "UOFU_AZCV_P04"
+chm_name <- "UOFU_AZCV_P01"
 
 # Safer smoothing settings
 smooth_dist_mult <- 0.5   # inward/outward smoothing distance in pixels
@@ -1429,36 +1412,36 @@ crowns_sf <- st_as_sf(crowns_poly) |>
 
 ## ---------------- SMOOTH ONLY LARGE CROWNS ----------------
 
-# Initial area for smoothing split
-crowns_sf$area_m2 <- as.numeric(st_area(crowns_sf))
-
-small_thresh <- small_thresh_mult * pix^2
-smooth_dist  <- smooth_dist_mult * pix
-smooth_tol   <- pix / 4
-
-small_sf <- crowns_sf[crowns_sf$area_m2 <= small_thresh, ]
-big_sf   <- crowns_sf[crowns_sf$area_m2 >  small_thresh, ]
-
-if (nrow(big_sf) > 0) {
-  new_geoms <- lapply(
-    st_geometry(big_sf),
-    safe_smooth_geom,
-    dist_m = smooth_dist,
-    tol_m  = smooth_tol
-  )
-
-  st_geometry(big_sf) <- st_sfc(new_geoms, crs = st_crs(big_sf))
-  big_sf <- big_sf[!st_is_empty(big_sf), ]
-}
-
-crowns_sf <- do.call(
-  rbind,
-  Filter(function(x) !is.null(x) && nrow(x) > 0, list(big_sf, small_sf))
-)
-
-if (is.null(crowns_sf) || nrow(crowns_sf) == 0) {
-  stop("No crowns remained after smoothing.")
-}
+# # Initial area for smoothing split
+# crowns_sf$area_m2 <- as.numeric(st_area(crowns_sf))
+# 
+# small_thresh <- small_thresh_mult * pix^2
+# smooth_dist  <- smooth_dist_mult * pix
+# smooth_tol   <- pix / 4
+# 
+# small_sf <- crowns_sf[crowns_sf$area_m2 <= small_thresh, ]
+# big_sf   <- crowns_sf[crowns_sf$area_m2 >  small_thresh, ]
+# 
+# if (nrow(big_sf) > 0) {
+#   new_geoms <- lapply(
+#     st_geometry(big_sf),
+#     safe_smooth_geom,
+#     dist_m = smooth_dist,
+#     tol_m  = smooth_tol
+#   )
+# 
+#   st_geometry(big_sf) <- st_sfc(new_geoms, crs = st_crs(big_sf))
+#   big_sf <- big_sf[!st_is_empty(big_sf), ]
+# }
+# 
+# crowns_sf <- do.call(
+#   rbind,
+#   Filter(function(x) !is.null(x) && nrow(x) > 0, list(big_sf, small_sf))
+# )
+# 
+# if (is.null(crowns_sf) || nrow(crowns_sf) == 0) {
+#   stop("No crowns remained after smoothing.")
+# }
 
 ## ---------------- OPTIONAL METRICS ----------------
 
@@ -1514,13 +1497,13 @@ m <-
     alpha = 1,
     legend = FALSE
   ) +
-  mapview(
-    plot_extent,
-    color = "blue",
-    alpha.regions = 0,
-    lwd = 3,
-    legend = FALSE
-  ) +
+  # mapview(
+  #   plot_extent,
+  #   color = "blue",
+  #   alpha.regions = 0,
+  #   lwd = 3,
+  #   legend = FALSE
+  # ) +
   mapview(
     crowns_sf,
     color = "black",
@@ -1765,10 +1748,10 @@ for (plot_id in Lidar_PlotNames) {
       dalponte2016(
         chm      = chm,
         treetops = ttops_sf,
-        th_tree  = th_tree_lidar,
-        th_seed  = th_seed_lidar,
-        th_cr    = th_cr_lidar,
-        max_cr   = max_cr_lidar
+        th_tree  = 0.5,
+        th_seed  = 0.25,
+        th_cr    = 0.3,
+        max_cr   = 20
       )(),
       error = function(e) {
         message("Dalponte CHM-only failed: ", e$message)
@@ -1987,7 +1970,6 @@ treePoints_Lidar <- allTreePoints_Lidar_final |>
   filter(plotID == chm_name)
 treePoints_Lidar <- st_as_sf(treePoints_Lidar)
 treePoints_Lidar <- st_zm(treePoints_Lidar, drop = TRUE, what = "ZM")
-
 
 
 # Subset the lidar tree crowns to the selected plot
@@ -2455,9 +2437,9 @@ if (source_name == "NAIP") {
 # Parameter grid
 param_grid <- expand.grid(
   th_tree = c(0.50),
-  th_seed = c(0.3, 0.35, 0.40, 0.45, 0.5, 0.55, 0.6),
-  th_cr   = c(0.3, 0.35, 0.4, 0.45, 0.55, 0.55, 0.60),
-  max_cr  = c(15, 20, 25),
+  th_seed = c(0.3),
+  th_cr   = c(0.6),
+  max_cr  = c(15),
   stringsAsFactors = FALSE
 )
 
@@ -2964,12 +2946,60 @@ best_iteration
 
 
 ```
+# Extract the model performance results
+```{r}
+
+# Extract the best iteration's plot-level metrics
+best_iteration_summary <- best_iteration$plot_metrics[[1]] %>%
+  group_by(plot_id) %>%
+  summarise(
+    observed_plot_biomass = first(observed_plot_biomass),
+    predicted_plot_biomass = first(predicted_plot_biomass),
+    residual = first(residual)
+  )
+
+# Plot the results
+ggplot(best_iteration_summary, aes(x = observed_plot_biomass, y = predicted_plot_biomass)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(
+    title = paste("Best Iteration: RMSE =", round(best_iteration$RMSE, 2), " | R2 =", round(best_iteration$R2, 3)),
+    x = "Observed Plot Biomass",
+    y = "Predicted Plot Biomass"
+  ) +
+  theme_minimal()
+
+
+
+
+
+```
+# Let's apply our model results to a single site-level NAIP CHM
+```{r}
+# Select a site CHM
+site_chm <- NAIPSiteRasters$UOFU_AZCV
+
+# Run tree detection with the best parameters
+best_params <- c(
+  a = best_iteration$a,
+  b = best_iteration$b,
+  c = best_iteration$c)
+
+# Run individual tree detection using set parameters
+
+
+
+
+```
 
 # Export the results
 ```{r}
 
 outNAIP_model <- r'(S:\ursa\howell\Research\PJ_forests\08_ModelResults\01_NAIP)'
 write_csv(optimization_results, paste0(outNAIP_model, "/NAIP_TreeDetection_Optimization_Results.csv"))
+
+outLidar_model <- r'(S:\ursa\howell\Research\PJ_forests\08_ModelResults\02_Lidar)'
+write_csv(optimization_results, paste0(outLidar_model, "/Lidar_TreeDetection_Optimization_Results.csv"))
 
 
 ```

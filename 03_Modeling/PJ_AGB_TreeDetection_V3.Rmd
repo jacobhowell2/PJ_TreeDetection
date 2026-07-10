@@ -1,0 +1,1822 @@
+---
+title: "Modeling Aboveground Biomass of Individual Trees in Pinyon-Juniper Woodlands"
+author: "Jake Howell"
+date: "`r Sys.Date()`"
+purpose: 
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: cosmo
+    highlight: tango
+---
+
+
+```{r}
+# Set output formats
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  fig.align = "center"
+)
+```
+
+## Setup Libraries
+```{r, include=FALSE}
+# Check required packages are installed
+pckgs <- c("sf",
+           "dplyr",
+           "sp",
+           "raster",
+           "terra",
+           "lidR",
+           "mapview",
+           "units",
+           "ggplot2",
+           "broom",
+           "purrr",
+           "stringr",
+           "tidyr",
+           "readr",
+           "leaflet")
+
+# Point to packages
+newPckgs <- pckgs[!(pckgs %in% installed.packages()[,"Package"])]
+
+# If length is greater than 0, install the packages
+if(length(newPckgs) > 0) install.packages(newPckgs)
+
+# Load libraries
+library(sf)
+library(dplyr)
+library(sp)
+library(raster)
+library(terra)
+library(lidR)
+library(mapview)
+library(units)
+library(ggplot2)
+library(broom)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(readr)
+library(leaflet)
+ 
+
+```
+
+## Initialize Data Paths
+```{r}
+# Set root data location
+loc <- r'(S:\ursa\howell\Research\PJ_forests)'
+
+# Set the name of the site data folder 
+foldSite <- "01_Sites"
+
+# Set the name of the plot level folder
+foldPlot <- "02_Plots"
+
+# Set the folder of NAIP-derived site-level CHMs
+foldNAIP_CHM <- "01_NAIP_CHMs"
+
+# Set the folder of the NAIP-derived plot-level CHM's
+foldNAIP_plots <- "01_NAIPDerivedCHMs"
+
+# Set the folder of the lidar-derived plot-level CHMs
+foldLidar_CHM <- "03_LidarDerivedCHMs/Original"
+
+# Set the name of the plot level .csv
+namePlotData <- "plot_level_data_uofu.csv"
+
+## TREE-LEVEL DATA: 
+foldTree <- "03_TreeData"
+
+# Set the name of the tree data
+nameTreeData <- "tree_level_data.csv"
+
+# Set name to AGB equations
+nameAGB <- "all_tree_species_in_pj_fia_plots_new.csv"
+
+# Initialize paths
+pathNAIPsites <- file.path(loc, foldSite, foldNAIP_CHM)
+pathNAIPplots <- file.path(loc, foldPlot, foldNAIP_plots)
+pathLidarPlots <- file.path(loc, foldPlot, foldLidar_CHM)
+pathPlotData <- file.path(loc, foldPlot, namePlotData)
+pathTreeData <- file.path(loc, foldTree, nameTreeData)
+pathAGBData <- file.path(loc, foldTree, nameAGB)
+
+```
+
+### Read in the raster data
+```{r}
+demPath <- r'(S:\ursa\howell\Research\PJ_forests\07_Ancillary\PRISM_us_dem_800m_bil\PRISM_us_dem_800m_bil.bil)'
+precipPath <- r'(S:\ursa\howell\Research\PJ_forests\07_Ancillary\prism_ppt_us_30s_2020_avg_30y\prism_ppt_us_30s_2020_avg_30y.tif)'
+pjPath <- r'(S:\ursa\howell\Research\PJ_forests\06_PJ_Extents\polygons\pj_polygon.shp)'
+sitePolyPath <- r'(S:\ursa\howell\Research\PJ_forests\01_Sites\00_SiteBounds\site_polygons.shp)'
+
+# Read data
+dem <- rast(demPath)
+ppt <- rast(precipPath)
+pj <- st_read(pjPath)
+siteBounds <- st_read(sitePolyPath)
+
+# Reproject
+dem <- project(dem, "EPSG:32612")
+ppt <- project(ppt, "EPSG:32612")
+pj  <- st_transform(pj, "EPSG:32612")
+siteBounds <- st_transform(siteBounds, "EPSG:32612")
+
+
+```
+
+## Read Data
+```{r}
+### Lidar Plot-Level Rasters----------------------------------------------------
+# List the lidar-derived plots within the folder
+lidarPlotCHM_names <- list.files(pathLidarPlots, pattern = "\\.tif$", full.names = TRUE)
+
+# Now read the rasters as a named list (strip path and extension)
+lidarPlotRasters <- setNames(
+  lapply(lidarPlotCHM_names, rast),
+  tools::file_path_sans_ext(basename(lidarPlotCHM_names))
+)
+
+### NAIP Plot-Level Rasters-----------------------------------------------------
+# List the NAIP-derived plots within the folder
+NAIPplotCHM_names <- list.files(pathNAIPplots, pattern = "\\.tif$", full.names = TRUE)
+
+# Now read the NAIP rasters as a named list (strip path, extension, and "buffered_" prefix)
+NAIPplotRasters <- setNames(
+  lapply(NAIPplotCHM_names, rast),
+  sub("^buffered_", "", tools::file_path_sans_ext(basename(NAIPplotCHM_names)))
+)
+
+### Field Data tables-----------------------------------------------------------
+# Read plot field data
+plotData <- read.csv(pathPlotData)
+
+# Read tree data
+treeData <- read.csv(pathTreeData)
+
+# Read biomass equations
+biomassEquations <- read.csv(pathAGBData)
+
+```
+
+### Apply Biomass Equatiosn to Field Data
+```{r}
+# In the tree data table, alter the species column
+treeData <- treeData |>
+  rename(Species = tree_sp)
+
+# In the biomass equations table, alter the species column so it matches with the tree table
+biomassEquations <- biomassEquations |>
+  rename(Species = plants.code)
+
+# Join the tree data to the biomass equations by Species column
+treeData <- left_join(treeData, biomassEquations, by = "Species")
+
+# Now estimate biomass for the field data trees by applying the biomass equations
+treeData <- treeData |>
+  mutate(tree_biomass_kg = exp(beta.0 + beta.1 * log(tree_diam)))
+
+# Remove outliers for plotting purposes
+treeData_filtered <- treeData |>
+  filter(tree_diam < 100)
+
+# Now plot the biomass of the field data trees and color by species
+ggplot2::ggplot(treeData_filtered, aes(x = tree_diam, y = tree_biomass_kg, color = common.name)) +
+  geom_point() +
+  labs(
+    title = "Species-Level AGB from Stem Diameter (DBH)",
+    x = "Diameter at Breast Height (cm)", 
+    y = "Aboveground Biomass (kg)",
+    color = "Tree Species"
+  ) +
+  theme_minimal()
+
+```
+
+### Create Field Plot Extents
+```{r}
+# Create function to make one polygon the four sides of each field plot extent
+createFieldPlotExtents <- function(row) {
+  coords <- matrix(c(
+    row$plot_ne_x, row$plot_ne_y,
+    row$plot_se_x, row$plot_se_y,
+    row$plot_sw_x, row$plot_sw_y,
+    row$plot_nw_x, row$plot_nw_y,
+    row$plot_ne_x, row$plot_ne_y
+  ), ncol = 2, byrow = TRUE)
+  st_polygon(list(coords))
+}
+
+# Go through each row of the plot data spreadsheet and create the field plot extents
+fieldPlots_extents <- plotData |>
+  rowwise() |>
+  mutate(geometry = st_sfc(createFieldPlotExtents(pick(everything())))) |>
+  ungroup()
+
+# Set the current CRS and reproject
+fieldPlots_extents <- st_as_sf(fieldPlots_extents, crs = 4326) |>
+  st_transform(32612)
+```
+
+### Sum the Plot-Level Biomass
+```{r}
+# Return just the plot ID's from the field plot data
+plot_ids <- unique(fieldPlots_extents$plot_id)
+
+# Subset the tree data to just the unique plot names
+treeDataInPlots_raw <- treeData[treeData$plot_id %in% plot_ids, ]
+
+# FIX THE ERROR IN LAT/LONG ASSIGNMENT:
+treeDataInPlots_fixed <- treeDataInPlots_raw %>%
+  mutate(
+    # start by assuming they are correct
+    lon = tree_x,
+    lat = tree_y,
+
+    # identify likely swapped rows:
+    # lon should be negative ~ -180..0 and lat should be positive ~ 0..90
+    swapped = (tree_x > 0 & tree_x < 90) & (tree_y < 0 & tree_y > -180),
+
+    # for swapped rows, flip them
+    lon = if_else(swapped, tree_y, lon),
+    lat = if_else(swapped, tree_x, lat)
+  )
+
+# Convert the treeDataInPlots to a spatial object
+treeDataInPlots_fixed <- st_as_sf(treeDataInPlots_fixed,
+                            coords = c("lon", "lat"), 
+                            crs = 4326,
+                            remove = FALSE)
+
+# Now transform to UTM Zone 12N
+treeDataInPlots <- st_transform(treeDataInPlots_fixed, 32612)
+
+# Estimate Biomass Summary for each plot
+plotLevelBiomass <- treeDataInPlots |>
+  group_by(plot_id) |>
+  summarise(
+    total_biomass = sum(tree_biomass_kg, na.rm = TRUE),
+    mean_biomass = mean(tree_biomass_kg, na.rm = TRUE),
+    n_trees_GPS = n(),
+    .groups = 'drop'
+  )
+
+
+```
+
+------------------------------ END DATA PREPARATION ----------------------------
+
+## Input Parameters for tree detection
+```{r}
+# 1) Set window size parameter:
+h <- function(x) {
+  cw <- 1.0827 * x - 0.3993
+  ws <- pmin(10, pmax(3, cw/2))
+  return(ws)
+}
+
+# 2) NAIP-derived segmentation parameters
+th_tree_NAIP  = 0.5
+th_seed_NAIP  = 0.3
+th_cr_NAIP    = 0.6
+max_cr_NAIP   = 15
+
+# 3) Lidar-derived segmentation parameters
+th_tree_lidar  = 0.5
+th_seed_lidar  = 0.25
+th_cr_lidar    = 0.3
+max_cr_lidar   = 15
+
+```
+
+
+### RUN NAIP-CHM TREE DETECTION: NO SMOOTHING
+```{r}
+# Save the names of the NAIP plots
+NAIP_PlotNames <- names(NAIPplotRasters)
+
+# Store tree tops and crowns as a list
+NAIP_treePoints_list <- list()
+NAIP_treeCrowns_list <- list()
+
+# Loop through each plot CHM and run tree detection
+for (plot_id in plot_ids) {
+
+  message("Processing plot: ", plot_id)
+
+   # Select a single plot CHM
+    chm <- NAIPplotRasters[[plot_id]]
+    
+    if (is.null(chm)) {
+      message("CHM is NULL for plot: ", plot_id)
+      next
+    }
+    
+    # Ensure proper projection
+    chm <- terra::project(chm, "EPSG:32612")
+    
+    # Identify Tree Tops
+    ttops <- tryCatch(
+      locate_trees(chm, lmf(ws = h, hmin = 0.5)),
+      error = function(e) {
+        message("Treetops failed: ", e$message)
+        NULL
+      }
+    )
+    
+    # Skip if no treetops
+    if (is.null(ttops) ||
+        (inherits(ttops, "data.frame") && nrow(ttops) == 0) ||
+        (inherits(ttops, "sf") && nrow(ttops) == 0) ||
+        (inherits(ttops, "SpatVector") && terra::nrow(ttops) == 0)) {
+      message("No treetops detected for plot: ", plot_id)
+      next
+    }
+    
+    # Convert to sf object
+    ttops_sf <- tryCatch(
+      st_as_sf(ttops),
+      error = function(e) {
+        message("st_as_sf failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(ttops_sf) || nrow(ttops_sf) == 0) {
+      message("No valid treetop sf object for plot: ", plot_id)
+      next
+    }
+    
+    # Run Dalponte2016 tree segmentation algorithm
+    crowns_id <- tryCatch(
+      dalponte2016(
+        chm      = chm,
+        treetops = ttops_sf,
+        th_tree  = th_tree_NAIP,
+        th_seed  = th_seed_NAIP,
+        th_cr    = th_cr_NAIP,
+        max_cr   = max_cr_NAIP
+      )(),
+      error = function(e) {
+        message("Dalponte CHM-only failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(crowns_id)) {
+      message("No crown raster returned for plot: ", plot_id)
+      next
+    }
+    
+    # Convert crown segmentation raster to polygons
+    crowns_poly <- tryCatch(
+      terra::as.polygons(crowns_id, dissolve = TRUE, na.rm = TRUE),
+      error = function(e) {
+        message("as.polygons failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(crowns_poly) || terra::nrow(crowns_poly) == 0) {
+      message("No crown polygons for plot: ", plot_id)
+      next
+    }
+    
+    # Store names as treeID
+    names(crowns_poly) <- "treeID"
+
+  # Calculate initial crown area for small/large classification
+  crowns_poly$area_m2 <- terra::expanse(crowns_poly, unit = "m")
+
+  # Extract the maximum height for each crown polygon
+  zmax <- tryCatch(
+    terra::extract(chm, crowns_poly, fun = max, na.rm = TRUE),
+    error = function(e) {
+      message("extract failed: ", e$message)
+      NULL
+    }
+  )
+
+  if (is.null(zmax) || nrow(zmax) != terra::nrow(crowns_poly)) {
+    message("Height extraction row mismatch for plot: ", plot_id,
+            " | crowns=", terra::nrow(crowns_poly),
+            " | zmax=", ifelse(is.null(zmax), 0, nrow(zmax)))
+    next
+  }
+
+  # Assign the maximum height to the crown polygons
+  crowns_poly$tree_height_m <- zmax[,2]
+
+  # Convert to sf
+  crowns_sf <- sf::st_as_sf(crowns_poly)
+
+  # Add plot ID
+  crowns_sf$plotID <- plot_id
+  ttops_sf$plotID <- plot_id
+
+  # Store
+  NAIP_treePoints_list[[plot_id]] <- ttops_sf
+  NAIP_treeCrowns_list[[plot_id]] <- crowns_sf
+}
+
+# Bind all rows
+allTreePoints_NAIP <- dplyr::bind_rows(NAIP_treePoints_list)
+allTreeCrowns_NAIP <- dplyr::bind_rows(NAIP_treeCrowns_list)
+
+# Check projection
+allTreePoints_NAIP <- st_transform(allTreePoints_NAIP, st_crs(fieldPlots_extents))
+allTreeCrowns_NAIP <- st_transform(allTreeCrowns_NAIP, st_crs(fieldPlots_extents))
+
+# Keep only the tree points that fall within the field plot extents
+ttops_in_plots <- allTreePoints_NAIP[
+  lengths(st_within(allTreePoints_NAIP, fieldPlots_extents)) > 0,
+]
+
+# Filter only the tree crowns which have an associated tree top that falls within the field plot extents
+keys <- ttops_in_plots %>%
+  st_drop_geometry() %>%
+  distinct(plotID, treeID)
+
+# Subset to only the crowns we want to keep
+allTreeCrowns_NAIP_final <- allTreeCrowns_NAIP %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+# Subset to only the tree tops we want to keep
+allTreePoints_NAIP_final <- allTreePoints_NAIP %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+```
+
+### Apply Crown Smoothing (NAIP)
+```{r}
+# Get CHM resolution (consistent across all NAIP plots)
+naip_res <- res(NAIPplotRasters[[1]])[1]
+
+# Set small crown threshold (3 pixels) — small crowns are left unsmoothed
+small_thresh <- 3 * naip_res^2
+
+# Split into small and large crowns by pre-smoothing area
+small_crowns_sf <- allTreeCrowns_NAIP_final[allTreeCrowns_NAIP_final$area_m2 <= small_thresh, ]
+big_crowns_sf   <- allTreeCrowns_NAIP_final[allTreeCrowns_NAIP_final$area_m2 > small_thresh, ]
+
+# Apply buffer-in / buffer-out smoothing only to large crowns
+big_crowns_sf <- big_crowns_sf |>
+  st_buffer(-0.75 * naip_res) |>
+  st_buffer(0.75 * naip_res) |>
+  st_simplify(preserveTopology = TRUE, dTolerance = naip_res / 4)
+
+# Recombine and drop any geometries that collapsed during smoothing
+allTreeCrowns_NAIP_smoothed <- bind_rows(big_crowns_sf, small_crowns_sf) |>
+  filter(!st_is_empty(geometry))
+
+# Cast to single-part polygons so split crowns become separate rows,
+# then keep only the largest fragment per crown
+allTreeCrowns_NAIP_smoothed <- allTreeCrowns_NAIP_smoothed |>
+  st_cast("POLYGON") |>
+  mutate(area_m2 = as.numeric(st_area(geometry))) |>
+  group_by(plotID, treeID) |>
+  slice_max(area_m2, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+cat("Crowns before smoothing:", nrow(allTreeCrowns_NAIP_final), "\n")
+cat("Crowns after smoothing: ", nrow(allTreeCrowns_NAIP_smoothed), "\n")
+```
+
+### Review results of NAIP-based tree detection
+```{r}
+# What's the name of the CHM you want to check?
+chm_name <- "UOFU_NMQU_P09"
+
+# Get the single NAIP CHM
+chm_NAIP <- NAIPplotRasters[[chm_name]]
+
+# Subset the NAIP tree points to selected plot
+treePoints_NAIP <- allTreePoints_NAIP_final |> 
+  filter(plotID == chm_name)
+
+# Convert to simple feature
+treePoints_NAIP <- st_as_sf(treePoints_NAIP)
+
+# Drop 0 values
+treePoints_NAIP <- st_zm(treePoints_NAIP, drop = TRUE, what = "ZM")
+
+# Subset the NAIP tree crowns — swap source to compare raw vs smoothed
+treeCrowns_NAIP <- allTreeCrowns_NAIP_final |>   
+  filter(plotID == chm_name) |>
+  st_as_sf() |>
+  st_zm(drop = TRUE, what = "ZM")
+
+# Subset the NAIP tree crowns to smoothed
+treeCrowns_NAIP_smoothed <- allTreeCrowns_NAIP_smoothed |>  
+  filter(plotID == chm_name) |>
+  st_as_sf() |>
+  st_zm(drop = TRUE, what = "ZM")
+
+# Get the GPS tree points for the plot
+fieldTrees <- treeDataInPlots %>%
+  filter(plot_id == chm_name)
+
+# Get the field plot extent 
+plot_extent <- fieldPlots_extents |>
+  filter(plot_id == chm_name)
+
+# Plot it
+mapview(
+    chm_NAIP,
+    layer.name = "NAIP CHM",
+    col.regions = colorRampPalette(c("red", "yellow", "darkgreen"))) +
+  mapview(treePoints_NAIP, 
+          color = "blue", 
+          layer.name = "NAIP Tree Tops") +
+  mapview(treeCrowns_NAIP, 
+          color = "red", 
+          lwd = 3,
+          layer.name = "NAIP Crowns") +
+  mapview(plot_extent, 
+          color = "black", 
+          lwd = 3, 
+          fill = NA, 
+          layer.name = "Field Plot Extents")
+
+# Plot the smoothed trees
+mapview(
+    chm_NAIP,
+    layer.name = "NAIP CHM",
+    col.regions = colorRampPalette(c("red", "yellow", "darkgreen"))) +
+  mapview(treePoints_NAIP, 
+          color = "blue", 
+          layer.name = "NAIP Tree Tops") +
+  mapview(treeCrowns_NAIP_smoothed, 
+          color = "red", 
+          lwd = 3,
+          layer.name = "NAIP Crowns") +
+  mapview(plot_extent, 
+          color = "black", 
+          lwd = 3, 
+          fill = NA, 
+          layer.name = "Field Plot Extents")
+
+```
+
+
+### RUN LIDAR-CHM TREE DETECTION
+```{r}
+# Save the names of the Lidar plots
+Lidar_PlotNames <- names(lidarPlotRasters)
+
+# Store tree tops and crowns as a list
+Lidar_treePoints_list <- list()
+Lidar_treeCrowns_list <- list()
+
+# Loop through each plot CHM and run tree detection
+for (plot_id in Lidar_PlotNames) {
+
+  message("Processing plot: ", plot_id)
+  
+   # Select a single plot CHM
+    chm <- lidarPlotRasters[[plot_id]]
+    
+    if (is.null(chm)) {
+      message("CHM is NULL for plot: ", plot_id)
+      next
+    }
+    
+    # Ensure proper projection
+    chm <- terra::project(chm, "EPSG:32612")
+    
+    # Identify Tree Tops
+    ttops <- tryCatch(
+      locate_trees(chm, lmf(ws = h, hmin = 0.5)),
+      error = function(e) {
+        message("Treetops failed: ", e$message)
+        NULL
+      }
+    )
+    
+    # Skip if no treetops
+    if (is.null(ttops) ||
+        (inherits(ttops, "data.frame") && nrow(ttops) == 0) ||
+        (inherits(ttops, "sf") && nrow(ttops) == 0) ||
+        (inherits(ttops, "SpatVector") && terra::nrow(ttops) == 0)) {
+      message("No treetops detected for plot: ", plot_id)
+      next
+    }
+    
+    # Convert to sf object
+    ttops_sf <- tryCatch(
+      st_as_sf(ttops),
+      error = function(e) {
+        message("st_as_sf failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(ttops_sf) || nrow(ttops_sf) == 0) {
+      message("No valid treetop sf object for plot: ", plot_id)
+      next
+    }
+    
+    # Run Dalponte2016 tree segmentation algorithm
+    crowns_id <- tryCatch(
+      dalponte2016(
+        chm      = chm,
+        treetops = ttops_sf,
+        th_tree  = th_tree_lidar,
+        th_seed  = th_seed_lidar,
+        th_cr    = th_cr_lidar,
+        max_cr   = max_cr_lidar
+      )(),
+      error = function(e) {
+        message("Dalponte CHM-only failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(crowns_id)) {
+      message("No crown raster returned for plot: ", plot_id)
+      next
+    }
+    
+    # Convert crown segmentation raster to polygons
+    crowns_poly <- tryCatch(
+      terra::as.polygons(crowns_id, dissolve = TRUE, na.rm = TRUE),
+      error = function(e) {
+        message("as.polygons failed: ", e$message)
+        NULL
+      }
+    )
+    
+    if (is.null(crowns_poly) || terra::nrow(crowns_poly) == 0) {
+      message("No crown polygons for plot: ", plot_id)
+      next
+    }
+    
+    # Store names as treeID
+    names(crowns_poly) <- "treeID"  
+
+  # Drop empty / invalid geometries
+  crowns_poly <- crowns_poly[!terra::is.empty(crowns_poly), ]
+
+  if (nrow(crowns_poly) == 0) next
+
+  # Calculate Crown Area in m2
+  crowns_poly$area_m2 <- terra::expanse(crowns_poly, unit = "m")
+
+  # Extract the maximum height for each crown polygon
+  zmax <- tryCatch(
+    terra::extract(chm, crowns_poly, fun = max, na.rm = TRUE),
+    error = function(e) {
+      message("extract failed: ", e$message)
+      NULL
+    }
+  )
+
+  if (is.null(zmax) || nrow(zmax) != terra::nrow(crowns_poly)) {
+    message("Height extraction row mismatch for plot: ", plot_id,
+            " | crowns=", terra::nrow(crowns_poly),
+            " | zmax=", ifelse(is.null(zmax), 0, nrow(zmax)))
+    next
+  }
+
+  # Assign the maximum height to the crown polygons
+  crowns_poly$tree_height_m <- zmax[,2]
+
+  # Convert to sf 
+  crowns_sf <- sf::st_as_sf(crowns_poly)
+
+  # Add plot ID
+  crowns_sf$plotID <- plot_id
+  ttops_sf$plotID <- plot_id
+
+  # Store
+  Lidar_treePoints_list[[plot_id]] <- ttops_sf
+  Lidar_treeCrowns_list[[plot_id]] <- crowns_sf
+}
+
+# Bind all rows
+allTreePoints_Lidar <- dplyr::bind_rows(Lidar_treePoints_list)
+allTreeCrowns_Lidar <- dplyr::bind_rows(Lidar_treeCrowns_list)
+
+# Check projection
+allTreePoints_Lidar <- st_transform(allTreePoints_Lidar, st_crs(fieldPlots_extents))
+allTreeCrowns_Lidar <- st_transform(allTreeCrowns_Lidar, st_crs(fieldPlots_extents))
+
+# Keep only the tree points that fall within the field plot extents
+ttops_in_plots <- allTreePoints_Lidar[
+  lengths(st_within(allTreePoints_Lidar, fieldPlots_extents)) > 0,
+]
+
+# Filter only the tree crowns which have an associated tree top that falls within the field plot extents
+keys <- ttops_in_plots %>%
+  st_drop_geometry() %>%
+  distinct(plotID, treeID)
+
+# Subset to only the crowns we want to keep
+allTreeCrowns_Lidar_final <- allTreeCrowns_Lidar %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+
+# Subset to only the tree tops we want to keep
+allTreePoints_Lidar_final <- allTreePoints_Lidar %>%
+  inner_join(keys, by = c("plotID", "treeID"))
+```
+
+### Review results of Lidar-based tree detection
+```{r}
+# What's the name of the CHM you want to check?
+chm_name <- "UOFU_AZTU_P03"
+
+# Get the single Lidar CHM
+chm_Lidar <- lidarPlotRasters[[chm_name]]
+
+# Subset the Lidar tree points to selected plot
+treePoints_Lidar <- allTreePoints_Lidar_final |> 
+  filter(plotID == chm_name)
+
+# Convert to simple feature
+treePoints_Lidar <- st_as_sf(treePoints_Lidar)
+
+# Drop 0 values
+treePoints_Lidar <- st_zm(treePoints_Lidar, drop = TRUE, what = "ZM")
+
+# Subset the Lidar tree crowns — swap source to compare raw vs smoothed
+treeCrowns_Lidar <- allTreeCrowns_Lidar_final |>   
+  filter(plotID == chm_name) |>
+  st_as_sf() |>
+  st_zm(drop = TRUE, what = "ZM")
+
+# Get the GPS tree points for the plot
+fieldTrees <- treeDataInPlots %>%
+  filter(plot_id == chm_name)
+
+# Get the field plot extent 
+plot_extent <- fieldPlots_extents |>
+  filter(plot_id == chm_name)
+
+class(treePoints_Lidar)
+# Plot it
+mapview(
+    chm_Lidar,
+    layer.name = "Lidar CHM",
+    col.regions = colorRampPalette(c("red", "yellow", "darkgreen"))) +
+  mapview(treePoints_Lidar, 
+          color = "blue", 
+          layer.name = "Lidar Tree Tops") +
+  mapview(treeCrowns_Lidar, 
+          color = "red", 
+          lwd = 3,
+          layer.name = "Lidar Crowns") +
+  mapview(plot_extent, 
+          color = "black", 
+          lwd = 3, 
+          fill = NA, 
+          layer.name = "Field Plot Extents")
+
+```
+
+### Create Models for the NAIP-derived tree list
+```{r}
+# Create tree and plot df
+model_trees_NAIP <- allTreeCrowns_NAIP_smoothed
+model_plots_NAIP <- plotLevelBiomass
+
+# Select tree variables
+model_trees_NAIP <- model_trees_NAIP[,c("plotID", "tree_height_m", "area_m2")]
+model_trees_NAIP <- st_drop_geometry(model_trees_NAIP)
+
+# Select plot variables
+model_plots_NAIP <- model_plots_NAIP[,c("plot_id", "total_biomass")]
+model_plots_NAIP <- st_drop_geometry(model_plots_NAIP)
+
+# Subset data to these variables
+colnames(model_trees_NAIP) <- c("plot_id", "tree_height", "tree_area")
+colnames(model_plots_NAIP) <- c("plot_id", "plot_biomass")
+
+# Merge the data
+model_df <- merge(model_plots_NAIP, model_trees_NAIP)
+
+# Split into list by plot
+plot_ids <- unique(model_df$plot_id)
+tree_list <- split(model_df, model_df$plot_id)
+
+# Extract the observed plot biomass
+plot_biomass <- tapply(model_df$plot_biomass, model_df$plot_id, FUN = function(x) x[1])
+
+# Define a predictive allometric model
+predict_plot_biomass <- function(params) {
+  a <- params[1]
+  b <- params[2]
+  c <- params[3]
+  # d <- params[4]
+  
+  pred <- numeric(length(tree_list))
+  names(pred) <- names(tree_list)
+  
+  for(i in seq_along(tree_list)) {
+    trees <- tree_list[[i]]
+    
+    # Equation 1: Power Law
+    tree_vals <- a * (trees$tree_height^b) * (trees$tree_area^c)
+    
+    # Equation 2: Additive 
+    # tree_vals <- a + b * trees$tree_height + c * trees$tree_area
+    
+    # Equation 3: Additive non-linear
+    # tree_vals <- a * (trees$tree_height^b) + c * (trees$tree_area^d)
+    
+    # Equation 4: Just tree height
+    # tree_vals <- a * (trees$tree_height^b)
+    
+    # Equation 5: Just crown area
+    # tree_vals <- a * (trees$tree_area^b)
+    
+    pred[i] <- sum(tree_vals, na.rm = TRUE)
+  }
+  
+  pred
+}
+
+# Define the objective function (sum of squared errors)
+objective <- function(params) {
+  pred <- predict_plot_biomass(params)
+  # ensure ordering matches
+  resid <- plot_biomass - pred[names(plot_biomass)]
+  sum(resid^2)
+}
+
+# Fit the model through numerical optimization
+start_vals <- c(a = 0.1, 
+                b = 1, 
+                c = 1
+)
+
+# Fit the parameters
+fit <- optim(
+  par = 
+    start_vals,
+  fn = objective,
+  
+  # Broyden, Fletcher, Goldfarb, and Shanno
+  # Uses function values and gradients to build up a picture of the surface to be optimized
+  method = "L-BFGS-B",
+  lower = c(1e-6, 
+            -5,
+            -5),
+  upper = c(100,  
+            5,
+            5))
+
+# Whats here?
+# The best set of parameters found
+# The coefficients for individual tree level biomass! 
+NAIPCoefficients <- fit$par 
+
+# Return the predicted biomass
+predicted <- predict_plot_biomass(fit$par)
+print(predicted)
+
+# Create a dataframe of the predicted biomass
+predicted_df <- as.data.frame(predicted)
+predicted_df$PlotID <- rownames(predicted_df)
+rownames(predicted_df) <- NULL
+
+# Create a dataframe of the measured plot biomass
+observed_df <- as.data.frame(plot_biomass)
+observed_df$PlotID <- rownames(observed_df)
+rownames(observed_df) <- NULL
+
+# Join the two biomass estimates
+final_NAIP_estimates <- left_join(predicted_df, observed_df, by = "PlotID")
+
+# Observed and predicted vectors
+obs <- plot_biomass
+pred <- predicted[names(plot_biomass)]   
+
+# 1. Root Mean Squared Error
+RMSE <- sqrt(mean((obs - pred)^2))
+print(RMSE)
+
+# 2. Mean Absolute Error
+MAE <- mean(abs(obs - pred))
+print(MAE)
+
+# 3. Bias (signed error)
+Bias <- mean(pred - obs)
+
+# 4. Mean Absolute Percent Error
+MAPE <- mean(abs((obs - pred) / obs)) * 100
+
+# 5. R-squared (coefficient of determination)
+SSE <- sum((obs - pred)^2)
+SST <- sum((obs - mean(obs))^2)
+R2 <- 1 - SSE/SST
+print(R2)
+
+# 6. Relative RMSE (RMSE / mean observed)
+rRMSE <- RMSE / mean(obs) * 100
+
+# Save metrics
+NAIP_TreeDetection_ModResults <- data.frame(
+  RMSE = RMSE,
+  MAE = MAE,
+  Bias = Bias,
+  MAPE_percent = MAPE,
+  R2 = R2,
+  rRMSE_percent = rRMSE
+)
+
+# Now plot the results
+plot(obs, pred,
+     xlab = "Observed plot biomass",
+     ylab = "Predicted plot biomass",
+     main = "Observed vs Predicted Plot Biomass")
+
+abline(0, 1, col = "red", lwd = 2)
+
+# Print the R2 result 
+text(x = min(obs),
+     y = max(pred),
+     labels = paste("R2 =", round(R2, 3)),
+     pos = 4)
+
+# Final NAIP estimates dataframe
+final_NAIP_estimates <- final_NAIP_estimates |>
+  dplyr::select(PlotID,
+                predicted,
+                plot_biomass) |>
+  rename("observed" = plot_biomass)
+
+```
+
+### Create models for lidar-derived tree list 
+```{r}
+# Create tree and plot df
+model_trees_lidar <- allTreeCrowns_Lidar_final
+model_plots_lidar <- plotLevelBiomass
+
+# Select tree variables
+model_trees_lidar <- model_trees_lidar[,c("plotID", "tree_height_m", "area_m2")]
+model_trees_lidar <- st_drop_geometry(model_trees_lidar)
+
+# Select plot variables
+model_plots_lidar <- model_plots_lidar[,c("plot_id", "total_biomass")]
+model_plots_lidar <- st_drop_geometry(model_plots_lidar)
+
+# Subset data to these variables
+colnames(model_trees_lidar) <- c("plot_id", "tree_height", "tree_area")
+colnames(model_plots_lidar) <- c("plot_id", "plot_biomass")
+
+# Merge the data
+df <- merge(model_plots_lidar, model_trees_lidar)
+
+# Split into list by plot
+plot_ids <- unique(df$plot_id)
+tree_list <- split(df, df$plot_id)
+
+# Extract the observed plot biomass
+plot_biomass <- tapply(df$plot_biomass, df$plot_id, FUN = function(x) x[1])
+
+# Define a predictive allometric model
+predict_plot_biomass <- function(params) {
+  a <- params[1]
+  b <- params[2]
+  c <- params[3]
+  # d <- params[4]
+  
+  pred <- numeric(length(tree_list))
+  names(pred) <- names(tree_list)
+  
+  for(i in seq_along(tree_list)) {
+    trees <- tree_list[[i]]
+    
+    # Equation 1: Power Law
+    tree_vals <- a * (trees$tree_height^b) * (trees$tree_area^c)
+    
+    # Equation 2: Additive 
+    # tree_vals <- a + b * trees$tree_height + c * trees$tree_area
+    
+    # Equation 3: Additive non-linear
+    # tree_vals <- a * (trees$tree_height^b) + c * (trees$tree_area^d)
+    
+    # Equation 4: Just tree height
+    # tree_vals <- a * (trees$tree_height^b)
+    
+    # Equation 5: Just crown area
+    # tree_vals <- a * (trees$tree_area^b)
+    
+    pred[i] <- sum(tree_vals, na.rm = TRUE)
+  }
+  
+  pred
+}
+
+# Define the objective function (sum of squared errors)
+objective <- function(params) {
+  pred <- predict_plot_biomass(params)
+  # ensure ordering matches
+  resid <- plot_biomass - pred[names(plot_biomass)]
+  sum(resid^2)
+}
+
+# Fit the model through numerical optimization
+start_vals <- c(a = 0.1, 
+                b = 1, 
+                c = 1
+)
+
+# Fit the parameters
+fit <- optim(
+  par = 
+    start_vals,
+  fn = objective,
+  
+  # Broyden, Fletcher, Goldfarb, and Shanno
+  # Uses function values and gradients to build up a picture of the surface to be optimized
+  method = "L-BFGS-B",
+  lower = c(1e-6, 
+            -5,
+            -5),
+  upper = c(100,  
+            5,
+            5))
+
+# Whats here?
+# The best set of parameters found
+# The coefficients for individual tree level biomass! 
+lidarCoefficients <- fit$par 
+
+# Return the predicted biomass
+predicted <- predict_plot_biomass(fit$par)
+print(predicted)
+
+# Create a dataframe of the predicted biomass
+predicted_df <- as.data.frame(predicted)
+predicted_df$PlotID <- rownames(predicted_df)
+rownames(predicted_df) <- NULL
+
+# Create a dataframe of the measured plot biomass
+observed_df <- as.data.frame(plot_biomass)
+observed_df$PlotID <- rownames(observed_df)
+rownames(observed_df) <- NULL
+
+# Join the two biomass estimates
+final_Lidar_estimates <- left_join(predicted_df, observed_df, by = "PlotID")
+
+# Observed and predicted vectors
+obs <- plot_biomass
+pred <- predicted[names(plot_biomass)]   
+
+# 1. Root Mean Squared Error
+RMSE <- sqrt(mean((obs - pred)^2))
+print(RMSE)
+
+# 2. Mean Absolute Error
+MAE <- mean(abs(obs - pred))
+print(MAE)
+
+# 3. Bias (signed error)
+Bias <- mean(pred - obs)
+
+# 4. Mean Absolute Percent Error
+MAPE <- mean(abs((obs - pred) / obs)) * 100
+
+# 5. R-squared (coefficient of determination)
+SSE <- sum((obs - pred)^2)
+SST <- sum((obs - mean(obs))^2)
+R2 <- 1 - SSE/SST
+print(R2)
+
+# 6. Relative RMSE (RMSE / mean observed)
+rRMSE <- RMSE / mean(obs) * 100
+
+# Save metrics
+Lidar_TreeDetection_ModResults <- data.frame(
+  RMSE = RMSE,
+  MAE = MAE,
+  Bias = Bias,
+  MAPE_percent = MAPE,
+  R2 = R2,
+  rRMSE_percent = rRMSE
+)
+
+# Now plot the results
+plot(obs, pred,
+     xlab = "Observed plot biomass",
+     ylab = "Predicted plot biomass",
+     main = "Observed vs Predicted Plot Biomass")
+
+abline(0, 1, col = "red", lwd = 2)
+
+# Print the R2 result 
+text(x = min(obs),
+     y = max(pred),
+     labels = paste("R2 =", round(R2, 3)),
+     pos = 4)
+
+# Edit final lidar estimates table
+final_Lidar_estimates <- final_Lidar_estimates |>
+  dplyr::select(PlotID,
+         predicted,
+         plot_biomass) |>
+  rename("observed" = plot_biomass)
+
+```
+
+### What are my modeling results? 
+```{r}
+# NAIP-derived tree detection result
+print(NAIP_TreeDetection_ModResults)
+
+# What are my individual tree level coefficients?
+print(NAIPCoefficients)
+NAIPCoefficients_df <- as.data.frame(NAIPCoefficients)
+
+# Lidar-derived tree detection result
+print(Lidar_TreeDetection_ModResults)
+
+# What are my individual tree level coefficients
+print(lidarCoefficients)
+lidarCoefficients_df <- as.data.frame(lidarCoefficients)
+
+```
+
+
+### Apply model coefficients to the NAIP tree list
+```{r}
+# Apply model coefficients to the NAIP-derived smoothed tree list
+NAIPTreeList_AGB <- allTreeCrowns_NAIP_smoothed
+NAIPTreeList_AGB$beta.a <- 3.4553996 
+NAIPTreeList_AGB$beta.b <- 0.8206139 
+NAIPTreeList_AGB$beta.c <- 0.9328608 
+
+# Calculate tree-level AGB using coefficients
+NAIPTreeList_AGB <- NAIPTreeList_AGB |>
+  mutate(tree_biomass = beta.a * (tree_height_m^beta.b) * (area_m2^beta.c))
+
+# Calculate plot-level AGB by summing tree-level biomass
+NAIPPlots_AGB <- NAIPTreeList_AGB |>
+  group_by(plotID) |>
+  summarise(predicted_AGB = sum(tree_biomass, na.rm = TRUE)) |>
+  rename(PlotID = "plotID")
+
+
+```
+
+### Apply model coefficients to the Lidar tree list
+```{r}
+LidarTreeList_AGB <- allTreeCrowns_Lidar_final
+LidarTreeList_AGB$beta.a <- 4.6192000 
+LidarTreeList_AGB$beta.b <- 1.1009588 
+LidarTreeList_AGB$beta.c <- 0.6555886 
+
+# Calculate tree-level AGB using coefficients
+LidarTreeList_AGB <- LidarTreeList_AGB |>
+  mutate(tree_biomass = beta.a * (tree_height_m^beta.b) * (area_m2^beta.c))
+
+```
+
+### Create landscape stratification
+```{r}
+# Create a buffer around PJ ecosystem
+pj_buffer <- st_buffer(pj, dist = 1000)  
+
+# Merge into a single spatial layer
+pj_buffer <- st_union(pj_buffer)
+
+# Clip & mask my rasters to the PJ extent
+dem_pj <- terra::mask(terra::crop(dem, pj_buffer), pj_buffer)
+ppt_pj <- terra::mask(terra::crop(ppt, pj_buffer), pj_buffer)
+
+# Create a landscape stratification
+names(dem_pj) <- "elevation"
+names(ppt_pj) <- "precipitation"
+
+# Create a composite raster
+compRast <- c(dem_pj, ppt_pj)
+
+# Create a landscape stratification
+stratRast <- sgsR::strat_quantiles(
+  mraster = compRast[[1:2]],
+  nStrat = list(3, 3),
+  plot = FALSE,
+  map = TRUE
+)
+
+# Select the stratified raster
+pj_strat <- stratRast[[3]]
+
+# # Export:
+# outStratPath <- r'(S:\ursa\howell\Research\PJ_forests\07_Ancillary\Stratification\pj_strat.tif)'
+# writeRaster(pj_strat, file.path(outStratPath))
+
+# Extract the strata class for the site extents
+siteBounds_strata <- siteBounds
+site_strata_vals <- terra::extract(pj_strat, siteBounds_strata, fun = modal, na.rm = TRUE)
+siteBounds_strata$site_strata <- round(strata_vals[,2])  # Extract the mean strata value and round to nearest integer)
+
+# Extract the strata class for the plot extents
+fieldPlots_strata <- fieldPlots_extents
+plot_strata_vals <- terra::extract(pj_strat, fieldPlots_strata, fun = modal, na.rm = TRUE)
+fieldPlots_strata$plot_strata <- round(plot_strata_vals[,2])  
+
+# Build a site-level strata lookup from siteBounds
+site_strata_lookup <- siteBounds_strata |>
+  sf::st_drop_geometry() |>
+  dplyr::select(site_id, site_strata)
+
+# Build a plot-level strata lookup from fieldPlots_strata
+plot_strata_lookup <- fieldPlots_strata %>%
+  st_drop_geometry() %>%
+  dplyr::select(plot_id, plot_strata)
+
+# Join site-level and plot-level strata to modeled estimates via site_id parsed from PlotID
+final_Lidar_estimates_strata <- final_Lidar_estimates |>
+  dplyr::select(-dplyr::any_of(c("strata", "site_id"))) |>
+  dplyr::mutate(site_id = sub("_P\\d+$", "", PlotID)) |>
+  dplyr::left_join(site_strata_lookup, by = "site_id") |>
+  left_join(plot_strata_lookup, by = c("PlotID" = "plot_id"))
+
+
+final_NAIP_estimates_strata <- final_NAIP_estimates |>
+  dplyr::select(-dplyr::any_of(c("strata", "site_id"))) |>
+  dplyr::mutate(site_id = sub("_P\\d+$", "", PlotID)) |>
+  dplyr::left_join(site_strata_lookup, by = "site_id") |>
+  dplyr::left_join(plot_strata_lookup, by = c("PlotID" = "plot_id"))
+
+# Define descriptive labels for the 9-class stratification (elevation x precipitation, 3x3 grid)
+# Classes increment across precipitation (low/mid/high) within each elevation band (low/mid/high)
+strata_label_key <- c(
+  "Low Elev / Low Precip",   # 1
+  "Low Elev / Mid Precip",   # 2
+  "Low Elev / High Precip",  # 3
+  "Mid Elev / Low Precip",   # 4
+  "Mid Elev / Mid Precip",   # 5
+  "Mid Elev / High Precip",  # 6
+  "High Elev / Low Precip",  # 7
+  "High Elev / Mid Precip",  # 8
+  "High Elev / High Precip"  # 9
+)
+
+# Separate lookups to avoid column name collisions on join
+site_strata_labels <- data.frame(site_strata = 1:9, site_strata_label = strata_label_key)
+plot_strata_labels <- data.frame(plot_strata  = 1:9, plot_strata_label  = strata_label_key)
+
+# Join site- and plot-level strata labels to both estimate data frames
+final_Lidar_estimates_strata <- final_Lidar_estimates_strata |>
+  dplyr::left_join(site_strata_labels, by = "site_strata") |>
+  dplyr::left_join(plot_strata_labels, by = "plot_strata")
+
+final_NAIP_estimates_strata <- final_NAIP_estimates_strata |>
+  dplyr::left_join(site_strata_labels, by = "site_strata") |>
+  dplyr::left_join(plot_strata_labels, by = "plot_strata")
+
+# Join n_trees_GPS from plotLevelBiomass to both estimate data frames
+trees_lookup <- plotLevelBiomass |>
+  sf::st_drop_geometry() |>
+  dplyr::select(plot_id, n_trees_GPS)
+
+final_Lidar_estimates_strata <- final_Lidar_estimates_strata |>
+  dplyr::left_join(trees_lookup, by = c("PlotID" = "plot_id"))
+
+final_NAIP_estimates_strata <- final_NAIP_estimates_strata |>
+  dplyr::left_join(trees_lookup, by = c("PlotID" = "plot_id"))
+
+
+
+
+
+```
+### LiDAR Observed vs. Predicted AGB by Site Strata
+```{r fig.width=6, fig.height=7}
+full_labels <- c(
+  "Low Elev / Low Precip",  "Low Elev / Mid Precip",  "Low Elev / High Precip",
+  "Mid Elev / Low Precip",  "Mid Elev / Mid Precip",  "Mid Elev / High Precip",
+  "High Elev / Low Precip", "High Elev / Mid Precip", "High Elev / High Precip"
+)
+strata_order_full <- paste0("Strata ", 1:9, ": ", full_labels)
+
+keep_strata <- c(1, 2, 3, 5, 6, 8, 9)
+
+lidar_plot_data <- final_Lidar_estimates_strata |>
+  dplyr::filter(!is.na(site_strata)) |>
+  dplyr::mutate(facet_label = factor(
+    paste0("Strata ", site_strata, ": ", full_labels[site_strata]),
+    levels = strata_order_full
+  ))
+
+site_trees_mean <- final_Lidar_estimates_strata |>
+  dplyr::filter(!is.na(site_strata), !is.na(n_trees_GPS)) |>
+  dplyr::group_by(strata = site_strata) |>
+  dplyr::summarise(mean_trees = mean(n_trees_GPS), .groups = "drop")
+
+lidar_annot_filt <- lidar_strata_stats |>
+  dplyr::filter(strata %in% keep_strata) |>
+  dplyr::left_join(site_trees_mean, by = "strata") |>
+  dplyr::mutate(
+    facet_label = factor(paste0("Strata ", strata, ": ", full_labels[strata]), levels = strata_order_full),
+    label = sprintf("RMSE = %.0f\nR\u00B2 = %.3f\nAvg Trees/Plot = %.0f", RMSE, R2, mean_trees)
+  )
+
+lidar_plot_filt <- lidar_plot_data |> dplyr::filter(site_strata %in% keep_strata)
+
+ax_lim <- range(c(lidar_plot_filt$observed, lidar_plot_filt$predicted), na.rm = TRUE)
+
+ggplot(lidar_plot_filt, aes(x = observed, y = predicted, color = site_strata)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_point(alpha = 0.75, size = 2) +
+  geom_text(
+    data = lidar_annot_filt,
+    aes(x = ax_lim[1], y = ax_lim[2], label = label),
+    hjust = 0, vjust = 1, size = 2.5, fontface = "bold", color = "grey20",
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~facet_label, ncol = 3) +
+  scale_color_gradientn(
+    colours = c("red3", "orange", "yellow2", "green3"),
+    limits  = c(1, 9)
+  ) +
+  guides(color = "none") +
+  coord_equal(xlim = ax_lim, ylim = ax_lim) +
+  labs(
+    x     = "Observed AGB (kg)",
+    y     = "Predicted AGB (kg)",
+    title = "LiDAR: Observed vs. Predicted Plot-Level AGB by Site Strata Class"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "grey90"),
+    strip.text       = element_text(face = "bold", size = 7),
+    plot.title       = element_text(face = "bold", hjust = 0.5, size = 10)
+  )
+```
+### NAIP Observed vs. Predicted AGB by Site Strata
+```{r fig.width=6, fig.height=7}
+naip_plot_data <- final_NAIP_estimates_strata |>
+  dplyr::filter(!is.na(site_strata)) |>
+  dplyr::mutate(facet_label = factor(
+    paste0("Strata ", site_strata, ": ", full_labels[site_strata]),
+    levels = strata_order_full
+  ))
+
+site_trees_mean_naip <- final_NAIP_estimates_strata |>
+  dplyr::filter(!is.na(site_strata), !is.na(n_trees_GPS)) |>
+  dplyr::group_by(strata = site_strata) |>
+  dplyr::summarise(mean_trees = mean(n_trees_GPS), .groups = "drop")
+
+naip_annot_filt <- naip_strata_stats |>
+  dplyr::filter(strata %in% keep_strata) |>
+  dplyr::left_join(site_trees_mean_naip, by = "strata") |>
+  dplyr::mutate(
+    facet_label = factor(paste0("Strata ", strata, ": ", full_labels[strata]), levels = strata_order_full),
+    label = sprintf("RMSE = %.0f\nR\u00B2 = %.3f\nAvg Trees/Plot = %.0f", RMSE, R2, mean_trees)
+  )
+
+naip_plot_filt <- naip_plot_data |> dplyr::filter(site_strata %in% keep_strata)
+
+ax_lim_naip <- range(c(naip_plot_filt$observed, naip_plot_filt$predicted), na.rm = TRUE)
+
+ggplot(naip_plot_filt, aes(x = observed, y = predicted, color = site_strata)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_point(alpha = 0.75, size = 2) +
+  geom_text(
+    data = naip_annot_filt,
+    aes(x = ax_lim_naip[1], y = ax_lim_naip[2], label = label),
+    hjust = 0, vjust = 1, size = 2.5, fontface = "bold", color = "grey20",
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~facet_label, ncol = 3) +
+  scale_color_gradientn(colours = c("red3", "orange", "yellow2", "green3"), limits = c(1, 9)) +
+  guides(color = "none") +
+  coord_equal(xlim = ax_lim_naip, ylim = ax_lim_naip) +
+  labs(
+    x     = "Observed AGB (kg)",
+    y     = "Predicted AGB (kg)",
+    title = "NAIP: Observed vs. Predicted Plot-Level AGB by Site Strata"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "grey90"),
+    strip.text       = element_text(face = "bold", size = 7),
+    plot.title       = element_text(face = "bold", hjust = 0.5, size = 10)
+  )
+```
+
+
+### LiDAR Observed vs. Predicted AGB by Plot Strata
+```{r fig.width=6, fig.height=7}
+# Per-plot-strata RMSE and R2 for LiDAR
+lidar_plot_strata_stats <- final_Lidar_estimates_strata |>
+  dplyr::filter(!is.na(plot_strata)) |>
+  dplyr::group_by(plot_strata, plot_strata_label) |>
+  dplyr::summarise(
+    n          = dplyr::n(),
+    RMSE       = sqrt(mean((predicted - observed)^2)),
+    R2         = cor(predicted, observed)^2,
+    mean_trees = mean(n_trees_GPS, na.rm = TRUE),
+    .groups    = "drop"
+  ) |>
+  dplyr::arrange(plot_strata)
+
+plot_strata_order_full <- paste0("Strata ", 1:9, ": ", full_labels)
+
+lidar_ps_data <- final_Lidar_estimates_strata |>
+  dplyr::filter(!is.na(plot_strata)) |>
+  dplyr::mutate(facet_label = factor(
+    paste0("Strata ", plot_strata, ": ", full_labels[plot_strata]),
+    levels = plot_strata_order_full
+  ))
+
+lidar_ps_annot <- lidar_plot_strata_stats |>
+  dplyr::mutate(
+    facet_label = factor(
+      paste0("Strata ", plot_strata, ": ", full_labels[plot_strata]),
+      levels = plot_strata_order_full
+    ),
+    label = sprintf("RMSE = %.0f\nR\u00B2 = %.3f\nAvg Trees/Plot = %.0f", RMSE, R2, mean_trees)
+  )
+
+ax_lidar_ps <- range(c(lidar_ps_data$observed, lidar_ps_data$predicted), na.rm = TRUE)
+
+ggplot(lidar_ps_data, aes(x = observed, y = predicted, color = plot_strata)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_point(alpha = 0.75, size = 2) +
+  geom_text(
+    data = lidar_ps_annot,
+    aes(x = ax_lidar_ps[1], y = ax_lidar_ps[2], label = label),
+    hjust = 0, vjust = 1, size = 2.5, fontface = "bold", color = "grey20",
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~facet_label, ncol = 3) +
+  scale_color_gradientn(colours = c("red3", "orange", "yellow2", "green3"), limits = c(1, 9)) +
+  guides(color = "none") +
+  coord_equal(xlim = ax_lidar_ps, ylim = ax_lidar_ps) +
+  labs(
+    x     = "Observed AGB (kg)",
+    y     = "Predicted AGB (kg)",
+    title = "LiDAR: Observed vs. Predicted Plot-Level AGB by Plot Strata"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "grey90"),
+    strip.text       = element_text(face = "bold", size = 7),
+    plot.title       = element_text(face = "bold", hjust = 0.5, size = 10)
+  )
+```
+
+
+### NAIP Observed vs. Predicted AGB by Plot Strata
+```{r fig.width=6, fig.height=7}
+# Per-plot-strata RMSE and R2 for NAIP
+naip_plot_strata_stats <- final_NAIP_estimates_strata |>
+  dplyr::filter(!is.na(plot_strata)) |>
+  dplyr::group_by(plot_strata, plot_strata_label) |>
+  dplyr::summarise(
+    n          = dplyr::n(),
+    RMSE       = sqrt(mean((predicted - observed)^2)),
+    R2         = cor(predicted, observed)^2,
+    mean_trees = mean(n_trees_GPS, na.rm = TRUE),
+    .groups    = "drop"
+  ) |>
+  dplyr::arrange(plot_strata)
+
+naip_ps_data <- final_NAIP_estimates_strata |>
+  dplyr::filter(!is.na(plot_strata)) |>
+  dplyr::mutate(facet_label = factor(
+    paste0("Strata ", plot_strata, ": ", full_labels[plot_strata]),
+    levels = plot_strata_order_full
+  ))
+
+naip_ps_annot <- naip_plot_strata_stats |>
+  dplyr::mutate(
+    facet_label = factor(
+      paste0("Strata ", plot_strata, ": ", full_labels[plot_strata]),
+      levels = plot_strata_order_full
+    ),
+    label = sprintf("RMSE = %.0f\nR\u00B2 = %.3f\nAvg Trees/Plot = %.0f", RMSE, R2, mean_trees)
+  )
+
+ax_naip_ps <- range(c(naip_ps_data$observed, naip_ps_data$predicted), na.rm = TRUE)
+
+ggplot(naip_ps_data, aes(x = observed, y = predicted, color = plot_strata)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_point(alpha = 0.75, size = 2) +
+  geom_text(
+    data = naip_ps_annot,
+    aes(x = ax_naip_ps[1], y = ax_naip_ps[2], label = label),
+    hjust = 0, vjust = 1, size = 2.5, fontface = "bold", color = "grey20",
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~facet_label, ncol = 3) +
+  scale_color_gradientn(colours = c("red3", "orange", "yellow2", "green3"), limits = c(1, 9)) +
+  guides(color = "none") +
+  coord_equal(xlim = ax_naip_ps, ylim = ax_naip_ps) +
+  labs(
+    x     = "Observed AGB (kg)",
+    y     = "Predicted AGB (kg)",
+    title = "NAIP: Observed vs. Predicted Plot-Level AGB by Plot Strata"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "grey90"),
+    strip.text       = element_text(face = "bold", size = 7),
+    plot.title       = element_text(face = "bold", hjust = 0.5, size = 10)
+  )
+```
+
+
+
+
+### Strata Results Summary
+```{r}
+# --- Site strata summary ---
+site_strata_results <- lidar_strata_stats |>
+  dplyr::filter(strata %in% keep_strata) |>
+  dplyr::left_join(site_trees_mean, by = "strata") |>
+  dplyr::select(strata, strata_label, n,
+                lidar_RMSE = RMSE, lidar_R2 = R2) |>
+  dplyr::left_join(
+    naip_strata_stats |>
+      dplyr::filter(strata %in% keep_strata) |>
+      dplyr::select(strata, naip_RMSE = RMSE, naip_R2 = R2),
+    by = "strata"
+  ) |>
+  dplyr::left_join(site_trees_mean, by = "strata") |>
+  dplyr::select(
+    `Strata`         = strata,
+    `Class`          = strata_label,
+    `n`              = n,
+    `LiDAR RMSE`     = lidar_RMSE,
+    `LiDAR R2`       = lidar_R2,
+    `NAIP RMSE`      = naip_RMSE,
+    `NAIP R2`        = naip_R2,
+    `Avg Trees/Plot` = mean_trees
+  ) |>
+  dplyr::mutate(dplyr::across(c(`LiDAR RMSE`, `NAIP RMSE`), \(x) round(x, 0)),
+                dplyr::across(c(`LiDAR R2`,   `NAIP R2`),   \(x) round(x, 3)),
+                `Avg Trees/Plot` = round(`Avg Trees/Plot`, 1))
+
+# --- Plot strata summary ---
+plot_strata_results <- lidar_plot_strata_stats |>
+  dplyr::select(strata = plot_strata, strata_label = plot_strata_label, n,
+                lidar_RMSE = RMSE, lidar_R2 = R2, mean_trees) |>
+  dplyr::left_join(
+    naip_plot_strata_stats |>
+      dplyr::select(strata = plot_strata, naip_RMSE = RMSE, naip_R2 = R2),
+    by = "strata"
+  ) |>
+  dplyr::select(
+    `Strata`         = strata,
+    `Class`          = strata_label,
+    `n`              = n,
+    `LiDAR RMSE`     = lidar_RMSE,
+    `LiDAR R2`       = lidar_R2,
+    `NAIP RMSE`      = naip_RMSE,
+    `NAIP R2`        = naip_R2,
+    `Avg Trees/Plot` = mean_trees
+  ) |>
+  dplyr::mutate(dplyr::across(c(`LiDAR RMSE`, `NAIP RMSE`), \(x) round(x, 0)),
+                dplyr::across(c(`LiDAR R2`,   `NAIP R2`),   \(x) round(x, 3)),
+                `Avg Trees/Plot` = round(`Avg Trees/Plot`, 1))
+
+cat("=== Site Strata ===\n")
+site_strata_results
+
+cat("\n=== Plot Strata ===\n")
+plot_strata_results
+
+outStratPath <- r'(S:\ursa\howell\Research\PJ_forests\08_ModelResults\03_StrataPerformance)'
+write.csv(site_strata_results, file.path(outStratPath, "siteStrataResults.csv"))
+write.csv(plot_strata_results, file.path(outStratPath, "plotStrataResults.csv"))
+
+```
+
+
+### Leave-One-Out Cross Validation
+```{r loocv-helper}
+# ── Shared LOOCV function ─────────────────────────────────────────────────────
+# Holds out each site in turn, refits the allometric model (a * h^b * area^c)
+# on the remaining sites, and predicts biomass for the held-out plots.
+#
+# plot_df : data.frame — PlotID, observed, predicted, Site
+# tree_df : data.frame — plot_id, tree_height, tree_area, Site
+
+run_loocv <- function(plot_df, tree_df) {
+
+  # Model form defined once
+  predict_biomass <- function(params, tree_list) {
+    a <- params[1]; b <- params[2]; c <- params[3]
+    vapply(tree_list, function(trees) {
+      sum(a * trees$tree_height^b * trees$tree_area^c, na.rm = TRUE)
+    }, numeric(1))
+  }
+
+  # SSE objective for optim — captures data via closure
+  make_objective <- function(tree_list, plot_biomass) {
+    function(params) {
+      pred  <- predict_biomass(params, tree_list)
+      resid <- plot_biomass - pred[names(plot_biomass)]
+      sum(resid^2)
+    }
+  }
+
+  sites   <- unique(plot_df$Site)
+  results <- list()
+
+  for (s in sites) {
+    message("Holding out: ", s)
+
+    # ── Training data (all sites except s) ──────────────────────────────────
+    train_plots <- plot_df |> filter(Site != s)
+    train_trees <- tree_df |> filter(Site != s)
+
+    train_tree_list <- split(train_trees, train_trees$plot_id)
+
+    # Drop training plots with no detected trees
+    train_plots    <- train_plots |> filter(PlotID %in% names(train_tree_list))
+    train_biomass  <- tapply(train_plots$observed, train_plots$PlotID,
+                             function(x) x[1])
+
+    # ── Fit model on training data ───────────────────────────────────────────
+    fit <- optim(
+      par    = c(a = 0.1, b = 1, c = 1),
+      fn     = make_objective(train_tree_list, train_biomass),
+      method = "L-BFGS-B",
+      lower  = c(1e-6, -5, -5),
+      upper  = c(100,   5,  5)
+    )
+
+    # ── Apply fitted coefficients to the held-out site ───────────────────────
+    test_plots     <- plot_df |> filter(Site == s)
+    test_trees     <- tree_df |> filter(Site == s)
+    test_tree_list <- split(test_trees, test_trees$plot_id)
+
+    # Drop test plots with no detected trees
+    test_plots <- test_plots |> filter(PlotID %in% names(test_tree_list))
+
+    cv_pred <- predict_biomass(fit$par, test_tree_list)
+    obs     <- tapply(test_plots$observed, test_plots$PlotID,
+                      function(x) x[1])
+
+    pnames <- names(cv_pred)
+    results[[s]] <- data.frame(
+      PlotID        = pnames,
+      Site          = s,
+      cv_pred       = cv_pred[pnames],
+      observed      = obs[pnames],
+      original_pred = test_plots$predicted[match(pnames, test_plots$PlotID)]
+    )
+  }
+
+  output <- bind_rows(results)
+
+  metrics <- output |>
+    filter(!is.na(observed)) |>
+    group_by(Site) |>
+    summarise(
+      n_plots = n(),
+      RMSE    = sqrt(mean((observed - cv_pred)^2)),
+      R2      = 1 - sum((observed - cv_pred)^2) /
+                    sum((observed - mean(observed))^2),
+      .groups = "drop"
+    ) |>
+    arrange(R2)
+
+  list(output = output, metrics = metrics)
+}
+
+# ── Add Site column to plot and tree tables ───────────────────────────────────
+extract_site <- function(x) str_extract(x, "^[^_]+_[^_]+")
+
+naip_plot_df  <- final_NAIP_estimates  |> mutate(Site = extract_site(PlotID))
+lidar_plot_df <- final_Lidar_estimates |> mutate(Site = extract_site(PlotID))
+naip_tree_df  <- model_trees_NAIP      |> mutate(Site = extract_site(plot_id))
+lidar_tree_df <- model_trees_lidar     |> mutate(Site = extract_site(plot_id))
+```
+
+```{r loocv-naip}
+# ── NAIP LOOCV ────────────────────────────────────────────────────────────────
+naip_loocv      <- run_loocv(naip_plot_df, naip_tree_df)
+naip_cv_output  <- naip_loocv$output
+naip_cv_metrics <- naip_loocv$metrics
+
+print(naip_cv_metrics)
+
+naip_mean_r2 <- mean(naip_cv_metrics$R2)
+naip_rmse    <- sqrt(mean((naip_cv_output$observed - naip_cv_output$cv_pred)^2, na.rm = TRUE))
+
+ax_limits <- c(0, max(naip_cv_output$observed,  naip_cv_output$cv_pred,
+                      na.rm = TRUE) * 1.05)
+
+# Per-site labels: R² and RMSE
+naip_labels <- naip_cv_metrics |>
+  mutate(
+    label = sprintf("R\u00B2 = %.2f\nRMSE = %.0f kg", R2, RMSE),
+    x     = -Inf,
+    y     = Inf
+  )
+
+ggplot(naip_cv_output |> filter(!is.na(observed)), aes(x = observed, y = cv_pred)) +
+  geom_point(size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_text(data = naip_labels, aes(x = x, y = y, label = label),
+            hjust = -0.05, vjust = 1.2, size = 3.5, inherit.aes = FALSE) +
+  scale_x_continuous(limits = ax_limits) +
+  scale_y_continuous(limits = ax_limits) +
+  facet_wrap(~ Site, ncol = 5) +
+  labs(
+    title    = "NAIP LOOCV: Observed vs. Predicted AGB",
+    subtitle = sprintf("Mean R\u00B2 = %.2f  |  RMSE = %.0f kg", naip_mean_r2, naip_rmse),
+    x        = "Observed AGB (kg)",
+    y        = "LOOCV Predicted AGB (kg)"
+  ) +
+  theme_minimal(base_size = 12)
+
+# R² bar chart
+ggplot(naip_cv_metrics, aes(y = reorder(Site, R2), x = R2)) +
+  geom_col() +
+  geom_vline(xintercept = naip_mean_r2, color = "red", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = naip_mean_r2 + 0.01, y = 0.5,
+           label = sprintf("Mean R\u00B2 = %.2f", naip_mean_r2),
+           hjust = 0, vjust = 0, color = "red", size = 3.5) +
+  labs(title = "NAIP-derived CHM: LOOCV R\u00B2 by Site",
+       x = expression(R^2), y = NULL) +
+  theme_minimal()
+```
+
+```{r loocv-lidar}
+# ── LiDAR LOOCV ───────────────────────────────────────────────────────────────
+lidar_loocv      <- run_loocv(lidar_plot_df, lidar_tree_df)
+lidar_cv_output  <- lidar_loocv$output
+lidar_cv_metrics <- lidar_loocv$metrics
+
+print(lidar_cv_metrics)
+
+lidar_mean_r2 <- mean(lidar_cv_metrics$R2)
+lidar_rmse    <- sqrt(mean((lidar_cv_output$observed - lidar_cv_output$cv_pred)^2, na.rm = TRUE))
+
+ax_limits <- c(0, max(lidar_cv_output$observed, lidar_cv_output$cv_pred,
+                      na.rm = TRUE) * 1.05)
+
+# Per-site labels: R² and RMSE
+lidar_labels <- lidar_cv_metrics |>
+  mutate(
+    label = sprintf("R\u00B2 = %.2f\nRMSE = %.0f kg", R2, RMSE),
+    x     = -Inf,
+    y     = Inf
+  )
+
+ggplot(lidar_cv_output |> filter(!is.na(observed)), aes(x = observed, y = cv_pred)) +
+  geom_point(size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_text(data = lidar_labels, aes(x = x, y = y, label = label),
+            hjust = -0.05, vjust = 1.2, size = 3.5, inherit.aes = FALSE) +
+  scale_x_continuous(limits = ax_limits) +
+  scale_y_continuous(limits = ax_limits) +
+  facet_wrap(~ Site, ncol = 5) +
+  labs(
+    title    = "LiDAR LOOCV: Observed vs. Predicted AGB",
+    subtitle = sprintf("Mean R\u00B2 = %.2f  |  RMSE = %.0f kg", lidar_mean_r2, lidar_rmse),
+    x        = "Observed AGB (kg/ha)",
+    y        = "LOOCV Predicted AGB (kg/ha)"
+  ) +
+  theme_minimal(base_size = 12)
+
+# R² bar chart
+ggplot(lidar_cv_metrics, aes(y = reorder(Site, R2), x = R2)) +
+  geom_col() +
+  geom_vline(xintercept = lidar_mean_r2, color = "red", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = lidar_mean_r2 + 0.01, y = 0.5,
+           label = sprintf("Mean R\u00B2 = %.2f", lidar_mean_r2),
+           hjust = 0, vjust = 0, color = "red", size = 3.5) +
+  labs(title = "LiDAR-derived CHM: LOOCV R\u00B2 by Site",
+       x = expression(R^2), y = NULL) +
+  theme_minimal()
+```
+
+
+
+
+### Export Data
+```{r}
+outNAIP_estimates <- r'(S:\ursa\howell\Research\PJ_forests\08_ModelResults\01_NAIP)'
+write.csv(final_NAIP_estimates, file = file.path(outNAIP_estimates, "/NAIP_estimates.csv"), append = TRUE)
+
+outLidar_estimates <- r'(S:\ursa\howell\Research\PJ_forests\08_ModelResults\02_Lidar)'
+write.csv(final_Lidar_estimates, file = file.path(outLidar_estimates, "/Lidar_estimates.csv"), append = TRUE)
+
+outNAIPTreeCrowns <- r'(S:\ursa\howell\Research\PJ_forests\03_TreeData\01_TreeDetection\01_NAIP_Derived\Smoothed1)'
+st_write(allTreeCrowns_NAIP_smoothed, file.path(outNAIPTreeCrowns, "TreeCrowns_NAIP.shp"), overwrite = TRUE)
+
+
+```
+
+
+
